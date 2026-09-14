@@ -1,93 +1,39 @@
 from datetime import datetime
-from database import get_game, get_units_for_match
-from game_data import build_champion_data, build_item_data, tex_path_to_url
-from game_analysis import stage_round, board_value
-from database import get_game, get_units_for_match, get_traits_for_match
-from game_data import build_champion_data, build_item_data, build_trait_data, tex_path_to_url
 import re
-from game_data import build_champion_data, build_item_data, build_trait_data, build_companion_lookup, companion_icon_url, tex_path_to_url
+from database import get_game, get_units_for_match, get_traits_for_match
+from game_analysis import stage_round, board_value
 from game_data import (
     build_champion_data, build_item_data, build_trait_data,
     build_companion_lookup, companion_icon_url, tex_path_to_url,
     build_trait_static_data,
 )
-from tactics_tools_data import fetch_plain_text as fetch_tactics_text, parse_champions, normalize_champion_name
-from tactics_tools_items import fetch_plain_text as fetch_items_text, parse_items
+from metatft_data import build_metatft_champion_lookup, build_metatft_item_lookup, build_metatft_item_name_lookup
 
 def format_short_date(timestamp_ms: int) -> str:
     return datetime.fromtimestamp(timestamp_ms / 1000).strftime("%d %b")
 
-DESCRIPTOR_SENTENCE_PATTERN = re.compile(r'([A-Z][A-Za-z\s]{2,25}:\s[^.]*\.)')
-STRUCTURAL_KEYWORDS = {"Passive", "Active", "Adaptor"}
+_metatft_champion_cache = None
+_metatft_item_cache = None
+_metatft_item_name_cache = None
 
 
-def format_descriptor_sentences(text: str, riftbeast_icon_url: str = None) -> str:
-    matches = list(DESCRIPTOR_SENTENCE_PATTERN.finditer(text))
-    if not matches:
-        return text
+def get_metatft_item_lookup() -> dict:
+    global _metatft_item_cache
+    if _metatft_item_cache is None:
+        _metatft_item_cache = build_metatft_item_lookup()
+    return _metatft_item_cache
 
-    result = text
-    for m in reversed(matches):
-        sentence = m.group(1)
-        keyword = sentence.split(":", 1)[0].strip()
+def get_metatft_item_name_lookup() -> dict:
+    global _metatft_item_name_cache
+    if _metatft_item_name_cache is None:
+        _metatft_item_name_cache = build_metatft_item_name_lookup()
+    return _metatft_item_name_cache
 
-        if keyword in STRUCTURAL_KEYWORDS:
-            continue
-
-        # Only treat this as a glossary definition if the keyword was
-        # already mentioned earlier in the text as a bare word — that's
-        # the "used it, now defining it" pattern. A trigger phrase like
-        # "Combat start:" never appears standalone beforehand.
-        text_before = text[:m.start()]
-        if not re.search(rf'\b{re.escape(keyword)}\b(?!:)', text_before):
-            continue
-
-        badge_html = ""
-        if riftbeast_icon_url and keyword.endswith("Buff"):
-            badge_html = (
-                "<span style='display:inline-flex;align-items:center;justify-content:center;"
-                "width:16px;height:16px;border-radius:50%;background:transparent;border:none;"
-                "margin-right:4px;vertical-align:-1px;position:relative;overflow:hidden;'>"
-                "<img src='" + riftbeast_icon_url + "' style='width:12px;height:12px;filter:grayscale(100%);' />"
-                "<span style='position:absolute;inset:0;background:#8fae30;mix-blend-mode:color;'></span>"
-                "</span>"
-            )
-
-        wrapped = f"<br><br><span style='color:#888; font-style:italic;'>{badge_html}{sentence}</span>"
-        result = result[:m.start()] + wrapped + result[m.end():]
-
-    return result
-
-_tactics_lookup_cache = None
-_tactics_items_cache = None
-
-
-def get_tactics_item_lookup(known_names: set) -> dict:
-    global _tactics_items_cache
-    if _tactics_items_cache is None:
-        text = fetch_items_text()
-        _tactics_items_cache = parse_items(text, known_names)
-    return _tactics_items_cache
-
-def get_tactics_ability_lookup(known_names: dict) -> dict:
-    """
-    Maps our own character_id -> tactics.tools ability data, matching
-    by champion display name (normalized to handle formatting
-    differences like 'Lux (Coven)' vs 'Lux Coven').
-    """
-    global _tactics_lookup_cache
-    if _tactics_lookup_cache is None:
-        text = fetch_tactics_text()
-        parsed = parse_champions(text)
-        _tactics_lookup_cache = {normalize_champion_name(k): v for k, v in parsed.items()}
-
-    result = {}
-    for character_id, display_name in known_names.items():
-        normalized = normalize_champion_name(display_name)
-        entry = _tactics_lookup_cache.get(normalized)
-        if entry:
-            result[character_id] = entry
-    return result
+def get_metatft_champion_lookup(champion_data: dict) -> dict:
+    global _metatft_champion_cache
+    if _metatft_champion_cache is None:
+        _metatft_champion_cache = build_metatft_champion_lookup(champion_data)
+    return _metatft_champion_cache
 
 def time_ago(timestamp_ms: int) -> str:
     then = datetime.fromtimestamp(timestamp_ms / 1000)
@@ -109,17 +55,6 @@ def strip_markup_tags(text: str) -> str:
     text = re.sub(r'\s{2,}', ' ', text)
     return text.strip()
 
-def synthesize_emblem_description(item_name: str) -> str:
-    """
-    Emblems have no patch-variable numbers — they just grant a fixed
-    trait. Rather than depend on a scraped source for this, we derive
-    it directly from the item's own name.
-    """
-    if item_name.endswith("Emblem"):
-        trait_name = item_name[: -len("Emblem")].strip()
-        return f"Grants the {trait_name} trait."
-    return ""
-
 def clean_game_text(text: str) -> str:
     """
     For champion ability text — scaling values can't be resolved,
@@ -130,14 +65,6 @@ def clean_game_text(text: str) -> str:
     text = re.sub(r'@[^@]+@', '?', text)
     text = re.sub(r'%i:[^%]+%', '', text)
     return strip_markup_tags(text)
-
-def resolve_tactics_text(description: str, star_level: int) -> str:
-    def pick_star_value(m):
-        values = m.group(0).split("/")
-        idx = min(star_level - 1, len(values) - 1)
-        return values[idx]
-
-    return re.sub(r'\d+(?:\.\d+)?(?:%?/\d+(?:\.\d+)?%?){1,}', pick_star_value, description)
 
 STAT_ICON_URLS = {
     "AD": "https://ap.tft.tools/img/general/ad.png?w=14",
@@ -150,6 +77,9 @@ STAT_ICON_URLS = {
     "Attack Damage": "https://ap.tft.tools/img/general/ad.png?w=14",
     "Mana Regen": "https://ap.tft.tools/img/general/mana_regen.png?w=14",
     "Durability": "https://ap.tft.tools/img/general/dr.png?w=14",
+    "Crit Chance": "https://ap.tft.tools/img/general/crit_chance.png?w=14",
+    "Crit Damage": "https://ap.tft.tools/img/general/crit_damage.png?w=14",
+    "Critical Strike Chance": "https://ap.tft.tools/img/general/crit_chance.png?w=14",
 }
 
 SCALE_TOKEN_ICONS = {
@@ -161,6 +91,8 @@ SCALE_TOKEN_ICONS = {
     "scaleHealth": STAT_ICON_URLS["Health"],
     "scaleManaRegen": STAT_ICON_URLS["Mana Regen"],
     "scaleDR": STAT_ICON_URLS["Durability"],
+    "scaleCrit": STAT_ICON_URLS["Crit Chance"],
+    "scaleCritMult": STAT_ICON_URLS["Crit Damage"],
 }
 
 
@@ -334,33 +266,211 @@ def corrected_trait_style(trait_name: str, num_units: int, style: int) -> int:
         return 3
     return style
 
-def insert_composite_scaling_icons(text: str, breakdown_raw: str) -> str:
+METATFT_ICON_URLS = {
+    "ad": STAT_ICON_URLS["AD"],
+    "ap": STAT_ICON_URLS["AP"],
+    "health": STAT_ICON_URLS["Health"],
+    "armor": STAT_ICON_URLS["Armor"],
+    "mr": STAT_ICON_URLS["Magic Resist"],
+    "as": STAT_ICON_URLS["Attack Speed"],
+    "manaregen": STAT_ICON_URLS["Mana Regen"],
+    "dura": STAT_ICON_URLS["Durability"],
+    "critchance": "https://ap.tft.tools/img/general/crit_chance.png?w=14",
+    "critdmg": "https://ap.tft.tools/img/general/crit_damage.png?w=14",
+    "coin": "https://ap.tft.tools/img/general/gold.png?w=14",
+    # omnivamp / damageamp: no confirmed ap.tft.tools asset for these —
+    # rendered as plain text (no icon) rather than guessing a URL.
+}
+
+METATFT_PERCENT_FORMATS = {"p", "percent"}
+METATFT_PERCENT_MINUS_ONE_FORMATS = {"percentminusone"}
+METATFT_INVERTED_PERCENT_FORMATS = {"invertedpercent"}
+
+
+def _metatft_icon_html(icon_attr: str) -> str:
     """
-    Handles shield/heal formulas like '400/500/2000 + 130/234/421.2',
-    which combine two different scaling types. Checks the breakdown
-    section for a '=' formula (e.g. '500 + 234 = 10% + 500') to
-    determine which term is percentage-based (Health) vs flat (AP).
+    metatft names every icon a value needs directly in its markup
+    (e.g. icon="icon.AD, icon.AP" for a value that scales off both) —
+    this replaces the old insert_stat_icons/insert_damage_type_icons
+    text-guessing heuristics with exact attribution.
     """
-    pattern = re.compile(r'([\d.]+(?:/[\d.]+)*)\s*\+\s*([\d.]+(?:/[\d.]+)*)')
+    html = ""
+    for token in (icon_attr or "").split(","):
+        token = token.strip().lower()
+        if token.startswith("icon."):
+            token = token[len("icon."):]
+        url = METATFT_ICON_URLS.get(token)
+        if url:
+            html += f"<img src='{url}' style='width:14px;height:14px;vertical-align:-2px;' /> "
+    return html
 
-    def replacer(m):
-        first, second = m.group(1), m.group(2)
-        # Look for this pair's formula in the breakdown text to see
-        # which side is the percentage term.
-        formula_match = re.search(
-            rf'{re.escape(first.split("/")[0])}\s*\+\s*{re.escape(second.split("/")[0])}\s*=\s*([\d.]+)%',
-            breakdown_raw
-        )
-        second_is_percent = formula_match is not None
+METATFT_STYLE_ICON_FALLBACK = {
+    "colorphysical": "ad",
+    "colormagic": "ap",
+    "colorhealth": "health",
+}
 
-        ap_icon = f"<img src='{STAT_ICON_URLS['AP']}' style='width:14px;height:14px;vertical-align:-2px;' />"
-        hp_icon = f"<img src='{STAT_ICON_URLS['Health']}' style='width:14px;height:14px;vertical-align:-2px;' />"
 
-        if second_is_percent:
-            return f"{ap_icon} {first} + {hp_icon} {second}"
-        return f"{ap_icon} {first} + {ap_icon} {second}"
+def _metatft_style_fallback_icon(attrs: str) -> str:
+    """
+    Some values carry a style="colorX" attribute but no icon= at all —
+    for the unambiguous color names (physical/magic/health always mean
+    AD/AP/Health in this game's convention) fall back to that. Deliberately
+    skips "colorStat" (could mean AS, AP, or others depending on the row —
+    guessing here is exactly the bug this migration replaced) and
+    "colorRadiant" (a highlight color for Radiant-item bonuses, not a
+    stat type — correctly has no icon).
+    """
+    style_m = re.search(r'style="(color\w+)"', attrs, re.IGNORECASE)
+    if not style_m:
+        return ""
+    token = METATFT_STYLE_ICON_FALLBACK.get(style_m.group(1).lower())
+    return _metatft_icon_html(f"icon.{token}") if token else ""
 
-    return pattern.sub(replacer, text)
+def _format_metatft_number(value, fmt: str) -> str:
+    fmt_key = (fmt or "").strip().lower()
+    if fmt_key in METATFT_PERCENT_MINUS_ONE_FORMATS:
+        value = (value - 1) * 100
+    elif fmt_key in METATFT_INVERTED_PERCENT_FORMATS:
+        value = (1 - value) * 100
+    elif fmt_key in METATFT_PERCENT_FORMATS:
+        value = value * 100
+    text = format_constant_value("", value)
+    if fmt_key in METATFT_PERCENT_FORMATS | METATFT_PERCENT_MINUS_ONE_FORMATS | METATFT_INVERTED_PERCENT_FORMATS:
+        text += "%"
+    return text
+
+def _resolve_metatft_curve_value(curve_values: dict, row: str, star_level: int):
+    """
+    curve_values entries are [star_threshold, value] pairs (e.g.
+    [[1, 0.25], [4, 0.25]]) — pick the value at the highest threshold
+    not exceeding star_level, falling back to the lowest entry.
+    """
+    entries = curve_values.get(row)
+    if not entries:
+        return None
+    entries = sorted(entries, key=lambda e: e[0])
+    chosen = entries[0][1]
+    for threshold, value in entries:
+        if threshold <= star_level:
+            chosen = value
+        else:
+            break
+    return chosen
+
+def resolve_metatft_markup(
+    desc: str,
+    attribute_values: dict,
+    curve_values: dict,
+    star_level: int = 1,
+    riftbeast_active: bool = False,
+) -> str:
+    """
+    Resolves metatft's description markup into display HTML. Unlike the
+    old tactics.tools pipeline, icon attribution and glossary/reminder
+    text are explicit in the markup itself (<TFTAttribute icon="...">,
+    <Rules>...</>) rather than guessed from the resolved plain text.
+    """
+    if not desc:
+        return ""
+
+    text = desc
+
+    def replace_attribute(m):
+        attrs = m.group(1)
+        icon_m = re.search(r'icon="([^"]*)"', attrs)
+        attr_id_m = re.search(r'attributeI[Dd]="([^"]*)"', attrs)
+        fmt_m = re.search(r'format="([^"]*)"', attrs)
+        icon_html = _metatft_icon_html(icon_m.group(1)) if icon_m else _metatft_style_fallback_icon(attrs)
+
+        if not attr_id_m:
+            return icon_html.strip()
+
+        values = attribute_values.get(attr_id_m.group(1))
+        if not values:
+            return icon_html.strip()
+
+        value = values[min(star_level - 1, len(values) - 1)]
+        number_text = _format_metatft_number(value, fmt_m.group(1) if fmt_m else "")
+        return f"{icon_html}{number_text}"
+
+    # TFTAttribute tags are sometimes truly self-closing ("... />") and
+    # sometimes opened-then-immediately-closed with a separate generic
+    # "</>" marker — both forms appear in real data. Handled as two
+    # separate passes (rather than one regex with an optional trailing
+    # "</>") because an optional group would also swallow an unrelated
+    # "</>" that belongs to an *enclosing* tag (e.g. a TFTConditionalStyle
+    # wrapping a self-closed attribute as its last piece of content) —
+    # confirmed this happens in real data. Splitting into two exact-match
+    # passes means the self-closing form never touches text after its own
+    # "/>", leaving any outer tag's closer alone for that tag's own pass.
+    text = re.sub(r'<TFTAttribute([^>]*)/>', replace_attribute, text)
+    text = re.sub(r'<TFTAttribute([^>]*)></>', replace_attribute, text)
+
+    def replace_curve(m):
+        attrs = m.group(1)
+        row_m = re.search(r'row="([^"]*)"', attrs)
+        fmt_m = re.search(r'format="([^"]*)"', attrs)
+        icon_m = re.search(r'icon="([^"]*)"', attrs)
+        icon_html = _metatft_icon_html(icon_m.group(1)) if icon_m else _metatft_style_fallback_icon(attrs)
+        if not row_m:
+            return icon_html.strip()
+        value = _resolve_metatft_curve_value(curve_values, row_m.group(1), star_level)
+        if value is None:
+            return m.group(0)
+        number_text = _format_metatft_number(value, fmt_m.group(1) if fmt_m else "")
+        return f"{icon_html}{number_text}"
+
+    text = re.sub(r'<TFTCurveTable([^>]*)/>', replace_curve, text)
+    text = re.sub(r'<TFTCurveTable([^>]*)></>', replace_curve, text)
+
+    # Normalize the game's own paragraph breaks before adding our own tags.
+    text = text.replace('\r', '')
+    text = re.sub(r'\n{2,}', '<br><br>', text)
+    text = re.sub(r'\n', '<br>', text)
+
+    # Keyword tags close with the same generic "</>" marker as everything
+    # else here — strip the tags but keep the highlighted word itself.
+    text = re.sub(r'<[Kk]eyword>(.*?)</>', r'\1', text, flags=re.DOTALL)
+
+    # colorRadiant/colorMagic/etc. appear as real child tags in some item
+    # text (not just as style="..." attributes on TFTAttribute) — strip
+    # them, no distinct styling for v1.
+    text = re.sub(r'<color\w*>(.*?)</>', r'\1', text, flags=re.DOTALL | re.IGNORECASE)
+
+    # Reminder/glossary text is explicitly tagged, e.g. <Rules>Wound:
+    # Reduces healing received.</> — no more "was this word used earlier
+    # as a bare word" heuristic needed. The source text already puts its
+    # own paragraph break (\r\n\r\n, normalized to <br><br> above) before
+    # a Rules block, so don't add another one here — that double-counts
+    # and leaves a much bigger gap than intended.
+    text = re.sub(
+        r'<[Rr]ules>(.*?)</>',
+        lambda m: f"<span style='color:#888; font-style:italic;'>{m.group(1)}</span>",
+        text,
+        flags=re.DOTALL,
+    )
+    text = re.sub(r'<[Bb]right>(.*?)</>', lambda m: f"<b>{m.group(1)}</b>", text, flags=re.DOTALL)
+    text = re.sub(r'<dim>(.*?)</>', lambda m: f"<span style='color:#888;'>{m.group(1)}</span>", text, flags=re.DOTALL)
+
+    def replace_conditional(m):
+        attrs, inner = m.group(1), m.group(2)
+        tag_m = re.search(r'tag="([^"]*)"', attrs)
+        is_riftbeast_tag = tag_m is not None and "Riftbeast" in tag_m.group(1)
+        active = riftbeast_active if is_riftbeast_tag else True
+        return inner if active else f"<span style='color:#888;'>{inner}</span>"
+
+    text = re.sub(r'<TFTConditionalStyle([^>]*)>(.*?)</>', replace_conditional, text, flags=re.DOTALL)
+
+    # metatft isn't fully resolved for every entry — an unresolved shared
+    # tooltip-snippet reference like "{Augment.Variant.HeartofSteel.Tooltip}"
+    # can leak through as a literal curly-brace placeholder. Drop it rather
+    # than show it, same as the old tactics.tools pipeline did for its own
+    # template artifacts.
+    text = re.sub(r'\{[^}]*\}', '', text)
+
+    text = re.sub(r'\s{2,}', ' ', text)
+    return text.strip()
 
 def get_match_detail(match_id: str, game_name: str, tag_line: str) -> dict:
     game_row = get_game(match_id)
@@ -404,12 +514,12 @@ def get_match_detail(match_id: str, game_name: str, tag_line: str) -> dict:
         })
     champion_data = build_champion_data(set_number)
     item_data = build_item_data()
-    all_item_names = {item["name"] for item in item_data.values()}
-    tactics_items = get_tactics_item_lookup(all_item_names)
+    metatft_items = get_metatft_item_lookup()
+    metatft_item_names = get_metatft_item_name_lookup()
 
     trait_by_name = build_trait_name_lookup(set_number)
-    known_names = {cid: c["name"] for cid, c in champion_data.items()}
-    tactics_abilities = get_tactics_ability_lookup(known_names)
+    metatft_champions = get_metatft_champion_lookup(champion_data)
+    riftbeast_active = any(t[0] == "DA_Riftbeast18" and t[2] != 0 for t in raw_traits)
 
     units_display = []
     for character_id, star_level, items_string in raw_units:
@@ -427,13 +537,14 @@ def get_match_detail(match_id: str, game_name: str, tag_line: str) -> dict:
             icon_url = tex_path_to_url(item["icon"]) if item.get("icon") else None
             item_name = item["name"]
 
-            desc = tactics_items.get(item_name, {}).get("description", "")
-            if not desc:
-                desc = synthesize_emblem_description(item_name)
-            else:
-                desc = insert_damage_type_icons(desc)
-                desc = insert_stat_icons(desc)
-                desc = format_descriptor_sentences(desc)
+            metatft_item = metatft_items.get(item_id) or metatft_item_names.get(item_name.lower())
+            desc = ""
+            if metatft_item and metatft_item.get("desc"):
+                desc = resolve_metatft_markup(
+                    metatft_item["desc"],
+                    metatft_item.get("attributeValues", {}),
+                    metatft_item.get("curveValues", {}),
+                )
 
             composition = item.get("composition") or []
             component_icons = []
@@ -452,20 +563,16 @@ def get_match_detail(match_id: str, game_name: str, tag_line: str) -> dict:
         ability = champ.get("ability") if champ else None
         ability_name = ability["name"] if ability else ""
 
-        tactics_entry = tactics_abilities.get(character_id)
-        if tactics_entry and tactics_entry.get("description"):
-            ability_desc = resolve_tactics_text(tactics_entry["description"], star_level)
-
-            riftbeast_icon_url = None
-            if champ and "Riftbeast" in (champ.get("traits") or []):
-                riftbeast_trait_info = trait_by_name.get("Riftbeast")
-                if riftbeast_trait_info and riftbeast_trait_info.get("icon"):
-                    riftbeast_icon_url = tex_path_to_url(riftbeast_trait_info["icon"])
-
-            ability_desc = format_descriptor_sentences(ability_desc, riftbeast_icon_url)
-            ability_desc = insert_composite_scaling_icons(ability_desc, tactics_entry.get("breakdown_raw", ""))
-            ability_desc = insert_damage_type_icons(ability_desc)
-            ability_desc = insert_stat_icons(ability_desc)
+        metatft_champ = metatft_champions.get(character_id)
+        metatft_ability = metatft_champ.get("ability") if metatft_champ else None
+        if metatft_ability and metatft_ability.get("desc"):
+            ability_desc = resolve_metatft_markup(
+                metatft_ability["desc"],
+                metatft_ability.get("attributeValues", {}),
+                metatft_champ.get("curveValues", {}),
+                star_level,
+                riftbeast_active,
+            )
         else:
             ability_desc = clean_game_text(ability["desc"]) if ability else ""
 
