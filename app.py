@@ -109,10 +109,15 @@ for match_id, placement, level, gold_left, last_round, game_datetime in history:
     label = f"{format_short_date(game_datetime)} &middot; {ordinal(placement)} Place &middot; Level {level} ({time_ago(game_datetime)})"
 
     left_html = "<div style='border-left: 6px solid " + color + "; padding-left: 10px;'>"
-    left_html += "<h4>" + detail['player_name'] + "#" + detail['tag_line'] + "</h4>"
+
+    top_row = "<div style='display:flex; align-items:center; gap:10px; margin-bottom:6px;'>"
     if detail["companion_icon"]:
-        left_html += "<img src='" + detail["companion_icon"] + "' title='" + (detail["companion_name"] or "") + "' style='width:48px;height:48px;border-radius:50%;object-fit:cover;object-position:center 30%;border:2px solid " + color + ";margin-top:4px;' />"
-    left_html += "<p style='font-size:22px;'>🏆 <span style='color:" + color + "; font-weight:bold;'>" + str(detail['placement']) + "</span></p>"
+        top_row += "<img src='" + detail["companion_icon"] + "' title='" + (detail["companion_name"] or "") + "' style='width:48px;height:48px;border-radius:50%;object-fit:cover;object-position:center 30%;border:2px solid " + color + ";' />"
+    top_row += "<span style='font-size:22px;'>🏆 <span style='color:" + color + "; font-weight:bold;'>" + str(detail['placement']) + "</span></span>"
+    top_row += "</div>"
+
+    left_html += top_row
+    left_html += "<h4>" + detail['player_name'] + "#" + detail['tag_line'] + "</h4>"
     left_html += "<p style='font-size:18px;'>🛡️ " + detail['rank_display'] + "</p>"
     left_html += "<p style='font-size:18px;'>🚩 " + detail['stage'] + "</p>"
     left_html += "<p style='font-size:18px;'>⚔️ " + str(detail['damage']) + "</p>"
@@ -157,7 +162,7 @@ for match_id, placement, level, gold_left, last_round, game_datetime in history:
             header = "<div style='position:relative;height:130px;background:#1a1d26;display:flex;flex-direction:column;justify-content:flex-end;'>"
 
         header += "<div style='position:relative;padding:8px;'>"
-        header += "<div style='font-size:15px;font-weight:bold;color:" + cost_color + ";margin-bottom:4px;'>" + unit["name"] + "</div>"
+        header += "<div style='font-size:20px;font-weight:bold;color:" + cost_color + ";margin-bottom:4px;text-shadow: -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000, 0 0 8px rgba(0,0,0,0.8);'>" + unit["name"] + "</div>"
 
         traits_line = ""
         for t in unit["unit_traits"]:
@@ -168,7 +173,11 @@ for match_id, placement, level, gold_left, last_round, game_datetime in history:
         header += "<div style='font-size:11px;color:#eee;display:flex;flex-wrap:wrap;gap:4px 8px;'>" + traits_line + "</div>"
         header += "</div></div>"
 
-        mana_text = str(unit["initial_mana"]) + " / " + str(unit["max_mana"]) if unit["max_mana"] else ""
+        if unit["max_mana"]:
+            mana_icon = "<img src='https://ap.tft.tools/img/general/mana.png?w=14' style='width:12px;height:12px;vertical-align:-2px;' /> "
+            mana_text = mana_icon + str(unit["initial_mana"]) + " / " + str(unit["max_mana"])
+        else:
+            mana_text = ""
         body = "<div style='padding:8px;border-top:1px solid #2e323d;'>"
         body += "<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;'>"
         body += "<span style='font-weight:bold;color:#fff;'>" + unit["ability_name"] + "</span>"
@@ -180,11 +189,35 @@ for match_id, placement, level, gold_left, last_round, game_datetime in history:
         star_span = "<span style='color:" + star_color + "; font-size:12px;'>&#9733;</span>"
         stars_html = "<div style='display:flex; justify-content:center; margin-top:2px;'>" + (star_span * unit["star_level"]) + "</div>"
 
-        item_imgs = "".join("<img src='" + icon + "' style='width:18px;height:18px;border:1px solid #222;' />" for icon in unit["item_icons"] if icon)
+        item_imgs = ""
+        for item in unit["item_details"]:
+            if not item["icon_url"]:
+                continue
+            img_tag = "<img src='" + item["icon_url"] + "' style='width:18px;height:18px;border:1px solid #222;' />"
+
+            header_row = "<div style='display:flex;align-items:center;gap:8px;margin-bottom:6px;'>"
+            header_row += "<img src='" + item["icon_url"] + "' style='width:24px;height:24px;border-radius:4px;' />"
+            header_row += "<span style='font-weight:bold;font-size:16px;color:#fff;'>" + item["name"] + "</span>"
+            header_row += "</div>"
+
+            desc_row = "<div style='color:#bbb;white-space:pre-line;'>" + item["description"] + "</div>"
+
+            if item["component_icons"]:
+                combo_row = "<div style='margin:10px 12px 0; padding:8px 0; border-top:1px solid #333; display:flex; align-items:center; gap:6px;'>"
+                for i, comp_icon in enumerate(item["component_icons"]):
+                    if i > 0:
+                        combo_row += "<span style='color:#888;'>+</span>"
+                    combo_row += "<img src='" + comp_icon + "' style='width:22px;height:22px;border-radius:4px;' />"
+                combo_row += "</div>"
+            else:
+                combo_row = "<div style='margin:10px 12px 0; padding:8px 0; border-top:1px solid #333;'><span style='color:#e05a5a; font-weight:bold; font-style:italic;'>Not craftable</span></div>"
+            tooltip_body = "<div style='padding:8px;'>" + header_row + desc_row + "</div>" + combo_row
+
+            item_imgs += "<div class='tft-tooltip-wrap'>" + img_tag + "<div class='tft-tooltip-content' style='border:2px solid #555;'>" + tooltip_body + "</div></div>"
+
         items_html = "<div style='display:flex; justify-content:center; margin-top:2px;'>" + item_imgs + "</div>"
 
         units_html += "<div style='display:flex; flex-direction:column; align-items:center; width:70px;'>" + stars_html + portrait_html + items_html + "</div>"
-    units_html += "</div>"
 
     card = "<details style='border: 3px solid " + color + "; border-radius: 8px; margin-bottom: 10px; padding: 0; background: #14171f;'>"
     card += "<summary style='padding: 12px; cursor: pointer; font-size: 16px; color: white;'>" + label + "</summary>"

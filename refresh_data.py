@@ -5,6 +5,8 @@ from patch_tracker import take_snapshot
 from wiki_ability_data import fetch_raw_lua
 import wiki_ability_data
 import tactics_tools_data
+import tactics_tools_items
+
 
 for path in (CACHE_FILE, COMPANIONS_CACHE_FILE, TRAIT_STATIC_CACHE_FILE):
     if os.path.exists(path):
@@ -14,6 +16,10 @@ for path in (CACHE_FILE, COMPANIONS_CACHE_FILE, TRAIT_STATIC_CACHE_FILE):
 wiki_ability_data._full_lookup_cache = None
 fetch_raw_lua(force_refresh=True)
 print("Refreshed wiki ability data.")
+
+tactics_tools_items._in_memory_cache = None
+tactics_tools_items.fetch_plain_text(force_refresh=True)
+print("Refreshed tactics.tools item data.")
 
 tactics_tools_data._in_memory_cache = None
 fetch_tactics_text_result = tactics_tools_data.fetch_plain_text(force_refresh=True)

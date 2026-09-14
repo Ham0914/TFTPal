@@ -12,12 +12,62 @@ from game_data import (
     build_trait_static_data,
 )
 from tactics_tools_data import fetch_plain_text as fetch_tactics_text, parse_champions, normalize_champion_name
+from tactics_tools_items import fetch_plain_text as fetch_items_text, parse_items
 
 def format_short_date(timestamp_ms: int) -> str:
     return datetime.fromtimestamp(timestamp_ms / 1000).strftime("%d %b")
 
-_tactics_lookup_cache = None
+DESCRIPTOR_SENTENCE_PATTERN = re.compile(r'([A-Z][A-Za-z\s]{2,25}:\s[^.]*\.)')
+STRUCTURAL_KEYWORDS = {"Passive", "Active", "Adaptor"}
 
+
+def format_descriptor_sentences(text: str, riftbeast_icon_url: str = None) -> str:
+    matches = list(DESCRIPTOR_SENTENCE_PATTERN.finditer(text))
+    if not matches:
+        return text
+
+    result = text
+    for m in reversed(matches):
+        sentence = m.group(1)
+        keyword = sentence.split(":", 1)[0].strip()
+
+        if keyword in STRUCTURAL_KEYWORDS:
+            continue
+
+        # Only treat this as a glossary definition if the keyword was
+        # already mentioned earlier in the text as a bare word — that's
+        # the "used it, now defining it" pattern. A trigger phrase like
+        # "Combat start:" never appears standalone beforehand.
+        text_before = text[:m.start()]
+        if not re.search(rf'\b{re.escape(keyword)}\b(?!:)', text_before):
+            continue
+
+        badge_html = ""
+        if riftbeast_icon_url and keyword.endswith("Buff"):
+            badge_html = (
+                "<span style='display:inline-flex;align-items:center;justify-content:center;"
+                "width:16px;height:16px;border-radius:50%;background:transparent;border:none;"
+                "margin-right:4px;vertical-align:-1px;position:relative;overflow:hidden;'>"
+                "<img src='" + riftbeast_icon_url + "' style='width:12px;height:12px;filter:grayscale(100%);' />"
+                "<span style='position:absolute;inset:0;background:#8fae30;mix-blend-mode:color;'></span>"
+                "</span>"
+            )
+
+        wrapped = f"<br><br><span style='color:#888; font-style:italic;'>{badge_html}{sentence}</span>"
+        result = result[:m.start()] + wrapped + result[m.end():]
+
+    return result
+
+_tactics_lookup_cache = None
+_tactics_items_cache = None
+
+
+def get_tactics_item_lookup(known_names: set) -> dict:
+    global _tactics_items_cache
+    if _tactics_items_cache is None:
+        text = fetch_items_text()
+        _tactics_items_cache = parse_items(text, known_names)
+    return _tactics_items_cache
 
 def get_tactics_ability_lookup(known_names: dict) -> dict:
     """
@@ -59,6 +109,16 @@ def strip_markup_tags(text: str) -> str:
     text = re.sub(r'\s{2,}', ' ', text)
     return text.strip()
 
+def synthesize_emblem_description(item_name: str) -> str:
+    """
+    Emblems have no patch-variable numbers — they just grant a fixed
+    trait. Rather than depend on a scraped source for this, we derive
+    it directly from the item's own name.
+    """
+    if item_name.endswith("Emblem"):
+        trait_name = item_name[: -len("Emblem")].strip()
+        return f"Grants the {trait_name} trait."
+    return ""
 
 def clean_game_text(text: str) -> str:
     """
@@ -78,6 +138,62 @@ def resolve_tactics_text(description: str, star_level: int) -> str:
         return values[idx]
 
     return re.sub(r'\d+(?:\.\d+)?(?:%?/\d+(?:\.\d+)?%?){1,}', pick_star_value, description)
+
+STAT_ICON_URLS = {
+    "AD": "https://ap.tft.tools/img/general/ad.png?w=14",
+    "AP": "https://ap.tft.tools/img/general/ap.png?w=14",
+    "Health": "https://ap.tft.tools/img/general/hp.png?w=14",
+    "Armor": "https://ap.tft.tools/img/general/armor.png?w=14",
+    "Magic Resist": "https://ap.tft.tools/img/general/mr.png?w=14",
+    "Attack Speed": "https://ap.tft.tools/img/general/as.png?w=14",
+    "Ability Power": "https://ap.tft.tools/img/general/ap.png?w=14",
+    "Attack Damage": "https://ap.tft.tools/img/general/ad.png?w=14",
+    "Mana Regen": "https://ap.tft.tools/img/general/mana_regen.png?w=14",
+    "Durability": "https://ap.tft.tools/img/general/dr.png?w=14",
+}
+
+SCALE_TOKEN_ICONS = {
+    "scaleAD": STAT_ICON_URLS["AD"],
+    "scaleAP": STAT_ICON_URLS["AP"],
+    "scaleAS": STAT_ICON_URLS["Attack Speed"],
+    "scaleArmor": STAT_ICON_URLS["Armor"],
+    "scaleMR": STAT_ICON_URLS["Magic Resist"],
+    "scaleHealth": STAT_ICON_URLS["Health"],
+    "scaleManaRegen": STAT_ICON_URLS["Mana Regen"],
+    "scaleDR": STAT_ICON_URLS["Durability"],
+}
+
+
+def render_scale_icon(token: str) -> str:
+    url = SCALE_TOKEN_ICONS.get(token)
+    if not url:
+        return ""
+    return f"<img src='{url}' style='width:14px;height:14px;vertical-align:-2px;' />"
+
+def insert_stat_icons(text: str) -> str:
+    """
+    Replaces stat name mentions with a small inline icon + the name,
+    e.g. 'AD' -> '<img .../> AD'. Longer names are matched first so
+    'Magic Resist' isn't partially caught by a shorter overlapping term.
+    """
+    for name in sorted(STAT_ICON_URLS, key=len, reverse=True):
+        icon_html = f"<img src='{STAT_ICON_URLS[name]}' style='width:14px;height:14px;vertical-align:-2px;' /> {name}"
+        text = re.sub(rf'\b{re.escape(name)}\b', icon_html, text)
+    return text
+
+def insert_damage_type_icons(text: str) -> str:
+    """
+    'physical damage' implies AD scaling, 'magic damage' implies AP —
+    standard TFT convention. Inserts the relevant icon right before
+    the number that precedes each phrase.
+    """
+    def make_replacer(stat_name):
+        icon_html = f"<img src='{STAT_ICON_URLS[stat_name]}' style='width:14px;height:14px;vertical-align:-2px;' /> "
+        return lambda m: icon_html + m.group(0)
+
+    text = re.sub(r'[\d.]+(?:%?/[\d.]+)*%?\s+physical damage', make_replacer("AD"), text)
+    text = re.sub(r'[\d.]+(?:%?/[\d.]+)*%?\s+magic damage', make_replacer("AP"), text)
+    return text
 
 def format_constant_value(name: str, value) -> str:
     if isinstance(value, float):
@@ -101,13 +217,31 @@ def resolve_trait_breakpoints(trait_static: dict, num_units_player: int) -> dict
         for c in group.get("constants", []):
             innate_constants[c["name"]] = c["value"]
 
-    intro_raw = parts[0]
-    intro_raw = re.sub(
-        r'@([^@]+)@',
-        lambda m: format_constant_value(m.group(1), innate_constants[m.group(1)]) if m.group(1) in innate_constants else m.group(0),
-        intro_raw
-    )
+    def substitute_intro_token(m):
+        expr = m.group(1)
+        if "*" in expr:
+            const_name, multiplier = expr.split("*", 1)
+            base = innate_constants.get(const_name.strip())
+            if base is None:
+                return m.group(0)
+            return format_constant_value(const_name, base * float(multiplier))
+        base = innate_constants.get(expr)
+        if base is None:
+            return m.group(0)
+        return format_constant_value(expr, base)
+
+    intro_raw = re.sub(r'@([^@]+)@', substitute_intro_token, parts[0])
+    scale_tokens_intro = {}
+    def stash_intro_icon(m):
+        placeholder = f"§ICON{len(scale_tokens_intro)}§"
+        scale_tokens_intro[placeholder] = render_scale_icon(m.group(1))
+        return placeholder
+    intro_raw = re.sub(r'%i:([^%]+)%', stash_intro_icon, intro_raw)
     intro = strip_markup_tags(intro_raw)
+    for placeholder, icon_html in scale_tokens_intro.items():
+        intro = intro.replace(placeholder, icon_html)
+    intro = insert_damage_type_icons(intro)
+    intro = insert_stat_icons(intro)
 
     breakpoints = trait_static.get("conditional_trait_sets", [])
     resolved = []
@@ -134,10 +268,21 @@ def resolve_trait_breakpoints(trait_static: dict, num_units_player: int) -> dict
             return format_constant_value(expr, base)
 
         row_text = re.sub(r'@([^@]+)@', substitute_token, row_text)
-        row_text = re.sub(r'%i:[^%]+%', '', row_text)
+        scale_tokens = {}
+        def stash_icon(m):
+            placeholder = f"§ICON{len(scale_tokens)}§"
+            scale_tokens[placeholder] = render_scale_icon(m.group(1))
+            return placeholder
+        row_text = re.sub(r'%i:([^%]+)%', stash_icon, row_text)
+
+        clean_text = strip_markup_tags(row_text)
+        for placeholder, icon_html in scale_tokens.items():
+            clean_text = clean_text.replace(placeholder, icon_html)
+        clean_text = insert_damage_type_icons(clean_text)
+        clean_text = insert_stat_icons(clean_text)
 
         resolved.append({
-            "text": strip_markup_tags(row_text),
+            "text": clean_text,
             "reached": num_units_player >= bp.get("min_units", 0),
         })
 
@@ -189,6 +334,34 @@ def corrected_trait_style(trait_name: str, num_units: int, style: int) -> int:
         return 3
     return style
 
+def insert_composite_scaling_icons(text: str, breakdown_raw: str) -> str:
+    """
+    Handles shield/heal formulas like '400/500/2000 + 130/234/421.2',
+    which combine two different scaling types. Checks the breakdown
+    section for a '=' formula (e.g. '500 + 234 = 10% + 500') to
+    determine which term is percentage-based (Health) vs flat (AP).
+    """
+    pattern = re.compile(r'([\d.]+(?:/[\d.]+)*)\s*\+\s*([\d.]+(?:/[\d.]+)*)')
+
+    def replacer(m):
+        first, second = m.group(1), m.group(2)
+        # Look for this pair's formula in the breakdown text to see
+        # which side is the percentage term.
+        formula_match = re.search(
+            rf'{re.escape(first.split("/")[0])}\s*\+\s*{re.escape(second.split("/")[0])}\s*=\s*([\d.]+)%',
+            breakdown_raw
+        )
+        second_is_percent = formula_match is not None
+
+        ap_icon = f"<img src='{STAT_ICON_URLS['AP']}' style='width:14px;height:14px;vertical-align:-2px;' />"
+        hp_icon = f"<img src='{STAT_ICON_URLS['Health']}' style='width:14px;height:14px;vertical-align:-2px;' />"
+
+        if second_is_percent:
+            return f"{ap_icon} {first} + {hp_icon} {second}"
+        return f"{ap_icon} {first} + {ap_icon} {second}"
+
+    return pattern.sub(replacer, text)
+
 def get_match_detail(match_id: str, game_name: str, tag_line: str) -> dict:
     game_row = get_game(match_id)
     (_, placement, level, gold_left, last_round, set_number,
@@ -231,6 +404,8 @@ def get_match_detail(match_id: str, game_name: str, tag_line: str) -> dict:
         })
     champion_data = build_champion_data(set_number)
     item_data = build_item_data()
+    all_item_names = {item["name"] for item in item_data.values()}
+    tactics_items = get_tactics_item_lookup(all_item_names)
 
     trait_by_name = build_trait_name_lookup(set_number)
     known_names = {cid: c["name"] for cid, c in champion_data.items()}
@@ -244,10 +419,35 @@ def get_match_detail(match_id: str, game_name: str, tag_line: str) -> dict:
         cost = champ["cost"] if champ else 1
 
         item_ids = items_string.split(", ") if items_string else []
-        item_icons = []
+        item_details = []
         for item_id in item_ids:
             item = item_data.get(item_id)
-            item_icons.append(tex_path_to_url(item["icon"]) if item and item.get("icon") else None)
+            if not item:
+                continue
+            icon_url = tex_path_to_url(item["icon"]) if item.get("icon") else None
+            item_name = item["name"]
+
+            desc = tactics_items.get(item_name, {}).get("description", "")
+            if not desc:
+                desc = synthesize_emblem_description(item_name)
+            else:
+                desc = insert_damage_type_icons(desc)
+                desc = insert_stat_icons(desc)
+                desc = format_descriptor_sentences(desc)
+
+            composition = item.get("composition") or []
+            component_icons = []
+            for comp_id in composition:
+                comp_item = item_data.get(comp_id)
+                if comp_item and comp_item.get("icon"):
+                    component_icons.append(tex_path_to_url(comp_item["icon"]))
+
+            item_details.append({
+                "name": item_name,
+                "icon_url": icon_url,
+                "description": desc,
+                "component_icons": component_icons,
+            })
 
         ability = champ.get("ability") if champ else None
         ability_name = ability["name"] if ability else ""
@@ -255,6 +455,17 @@ def get_match_detail(match_id: str, game_name: str, tag_line: str) -> dict:
         tactics_entry = tactics_abilities.get(character_id)
         if tactics_entry and tactics_entry.get("description"):
             ability_desc = resolve_tactics_text(tactics_entry["description"], star_level)
+
+            riftbeast_icon_url = None
+            if champ and "Riftbeast" in (champ.get("traits") or []):
+                riftbeast_trait_info = trait_by_name.get("Riftbeast")
+                if riftbeast_trait_info and riftbeast_trait_info.get("icon"):
+                    riftbeast_icon_url = tex_path_to_url(riftbeast_trait_info["icon"])
+
+            ability_desc = format_descriptor_sentences(ability_desc, riftbeast_icon_url)
+            ability_desc = insert_composite_scaling_icons(ability_desc, tactics_entry.get("breakdown_raw", ""))
+            ability_desc = insert_damage_type_icons(ability_desc)
+            ability_desc = insert_stat_icons(ability_desc)
         else:
             ability_desc = clean_game_text(ability["desc"]) if ability else ""
 
@@ -288,7 +499,7 @@ def get_match_detail(match_id: str, game_name: str, tag_line: str) -> dict:
             "name": name,
             "star_level": star_level,
             "portrait_url": portrait_url,
-            "item_icons": item_icons,
+            "item_details": item_details,
             "cost": cost,
             "ability_name": ability_name,
             "ability_desc": ability_desc,

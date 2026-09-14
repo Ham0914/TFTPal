@@ -142,6 +142,8 @@ def _parse_one_block(lines: list) -> dict:
 
     desc_lines = lines[desc_start:desc_end]
 
+    breakdown_lines = lines[desc_end:bracket_idx] if bracket_idx else []
+
     return {
         "name": name,
         "cost": cost,
@@ -150,4 +152,5 @@ def _parse_one_block(lines: list) -> dict:
         "start_mana": start_mana,
         "max_mana": max_mana,
         "description": " ".join(desc_lines).strip(),
+        "breakdown_raw": " ".join(breakdown_lines),
     }
