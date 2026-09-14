@@ -327,6 +327,35 @@ def _metatft_style_fallback_icon(attrs: str) -> str:
     token = METATFT_STYLE_ICON_FALLBACK.get(style_m.group(1).lower())
     return _metatft_icon_html(f"icon.{token}") if token else ""
 
+# Last-resort fallback for values with neither icon= nor a usable style=
+# (the "colorStat" case — could mean AS, AP, AD, etc. depending on the
+# specific value). TFT's own writing convention always spells out the
+# stat name in plain words right after a resolved number, so — verified
+# individually across every real case in the current dataset before
+# adding each entry here — peeking at just the next few words is safe
+# for these specific phrases. Deliberately excludes "Shield" (checked:
+# genuinely varies AP/Health/both depending on the unit, e.g. Taric's
+# is Health-only) and bare "damage" (ambiguous without a physical/magic
+# qualifier) rather than guess.
+METATFT_LOOKAHEAD_ICON_PATTERNS = [
+    (re.compile(r'^\s*Armor and Magic Resist', re.IGNORECASE), "icon.armor, icon.mr"),
+    (re.compile(r'^\s*(?:and\s+)?Attack Speed', re.IGNORECASE), "icon.as"),
+    (re.compile(r'^\s*(?:and\s+)?Attack Damage', re.IGNORECASE), "icon.ad"),
+    (re.compile(r'^\s*(?:and\s+)?Ability Power', re.IGNORECASE), "icon.ap"),
+    (re.compile(r'^\s*(?:max )?Health\b', re.IGNORECASE), "icon.health"),
+    (re.compile(r'^\s*Durability', re.IGNORECASE), "icon.dura"),
+    (re.compile(r'^\s*physical damage', re.IGNORECASE), "icon.ad"),
+    (re.compile(r'^\s*magic damage', re.IGNORECASE), "icon.ap"),
+    (re.compile(r'^\s*Critical Strike Chance', re.IGNORECASE), "icon.critchance"),
+]
+
+
+def _metatft_lookahead_icon(following_text: str) -> str:
+    for pattern, icon_tokens in METATFT_LOOKAHEAD_ICON_PATTERNS:
+        if pattern.match(following_text):
+            return _metatft_icon_html(icon_tokens)
+    return ""
+
 def _format_metatft_number(value, fmt: str) -> str:
     fmt_key = (fmt or "").strip().lower()
     if fmt_key in METATFT_PERCENT_MINUS_ONE_FORMATS:
@@ -382,6 +411,8 @@ def resolve_metatft_markup(
         attr_id_m = re.search(r'attributeI[Dd]="([^"]*)"', attrs)
         fmt_m = re.search(r'format="([^"]*)"', attrs)
         icon_html = _metatft_icon_html(icon_m.group(1)) if icon_m else _metatft_style_fallback_icon(attrs)
+        if not icon_html:
+            icon_html = _metatft_lookahead_icon(m.string[m.end():m.end() + 60])
 
         if not attr_id_m:
             return icon_html.strip()
@@ -413,6 +444,8 @@ def resolve_metatft_markup(
         fmt_m = re.search(r'format="([^"]*)"', attrs)
         icon_m = re.search(r'icon="([^"]*)"', attrs)
         icon_html = _metatft_icon_html(icon_m.group(1)) if icon_m else _metatft_style_fallback_icon(attrs)
+        if not icon_html:
+            icon_html = _metatft_lookahead_icon(m.string[m.end():m.end() + 60])
         if not row_m:
             return icon_html.strip()
         value = _resolve_metatft_curve_value(curve_values, row_m.group(1), star_level)
