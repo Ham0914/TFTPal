@@ -51,6 +51,31 @@ def top4_rate(set_number: int = 18, queue_id: int = 1100):
     return (top4_games / total_games) * 100
 
 
+def win_rate(set_number: int = 18, queue_id: int = 1100):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    queue_sql, queue_params = _build_queue_filter(queue_id)
+
+    cursor.execute(
+        f"SELECT COUNT(*) FROM games WHERE set_number = ? {queue_sql}",
+        (set_number,) + queue_params
+    )
+    total_games = cursor.fetchone()[0]
+
+    cursor.execute(
+        f"SELECT COUNT(*) FROM games WHERE set_number = ? {queue_sql} AND placement = 1",
+        (set_number,) + queue_params
+    )
+    wins = cursor.fetchone()[0]
+
+    conn.close()
+
+    if total_games == 0:
+        return 0
+    return (wins / total_games) * 100
+
+
 def placement_breakdown(set_number: int = 18, queue_id: int = 1100):
     conn = get_connection()
     cursor = conn.cursor()
@@ -91,7 +116,7 @@ def most_played_units(limit: int = 10, set_number: int = 18, queue_id: int = 110
     readable_results = []
     for character_id, times_played, avg_placement in results:
         name = champion_lookup.get(character_id, character_id)
-        readable_results.append((name, times_played, avg_placement))
+        readable_results.append((character_id, name, times_played, avg_placement))
 
     return readable_results
 
@@ -105,7 +130,7 @@ def match_history(set_number: int = 18, queue_id: int = 1100):
 
     queue_sql, queue_params = _build_queue_filter(queue_id)
     cursor.execute(f"""
-        SELECT match_id, placement, level, gold_left, last_round, game_datetime
+        SELECT match_id, placement, level, gold_left, last_round, game_datetime, queue_id
         FROM games
         WHERE set_number = ? {queue_sql}
         ORDER BY game_datetime DESC
@@ -124,7 +149,7 @@ if __name__ == "__main__":
         print(f"  {placement}: {count} game(s)")
 
     print("\nMost played units:")
-    for name, times_played, avg_placement in most_played_units():
+    for character_id, name, times_played, avg_placement in most_played_units():
         print(f"  {name}: played {times_played}x, avg placement {avg_placement:.2f}")
 
 

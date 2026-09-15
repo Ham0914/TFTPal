@@ -122,7 +122,18 @@ def save_match(match_data: dict, my_puuid: str, rank_info: dict = None):
     ))
 
     if cursor.rowcount == 0:
-        print(f"Match {match_id} already in database, skipping.")
+        if rank_info is not None:
+            cursor.execute("""
+                UPDATE games SET rank_tier = ?, rank_division = ?, league_points = ?
+                WHERE match_id = ? AND rank_tier IS NULL
+            """, (rank_tier, rank_division, league_points, match_id))
+            if cursor.rowcount > 0:
+                conn.commit()
+                print(f"Match {match_id} already in database — backfilled rank ({rank_tier} {rank_division}, {league_points} LP).")
+            else:
+                print(f"Match {match_id} already in database, skipping.")
+        else:
+            print(f"Match {match_id} already in database, skipping.")
         conn.close()
         return
 

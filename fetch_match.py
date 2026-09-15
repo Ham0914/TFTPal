@@ -66,6 +66,7 @@ def print_summary(participant: dict):
 # --- Main script logic (this is the ONLY entry point) ---
 if __name__ == "__main__":
     from database import create_tables, save_match
+    from rank import get_rank_for_match_queue
     import time
 
     create_tables()
@@ -75,10 +76,24 @@ if __name__ == "__main__":
 
     print(f"Found {len(match_ids)} recent matches. Fetching and saving each...\n")
 
+    # Ranked and Double Up have separate rank ladders — cache each queue's
+    # current rank per run rather than re-fetching it for every match.
+    rank_cache = {}
+
+    def rank_for_queue(match_queue_id):
+        if match_queue_id not in rank_cache:
+            try:
+                rank_cache[match_queue_id] = get_rank_for_match_queue(puuid, match_queue_id)
+            except Exception as e:
+                print(f"⚠️  Couldn't fetch current rank for queue {match_queue_id} ({e}) — saving without one.")
+                rank_cache[match_queue_id] = None
+        return rank_cache[match_queue_id]
+
     for match_id in match_ids:
         try:
             match_data = get_match_details(match_id, REGION)
-            save_match(match_data, puuid)
+            rank_info = rank_for_queue(match_data["info"]["queueId"])
+            save_match(match_data, puuid, rank_info=rank_info)
         except Exception as e:
             print(f"⚠️  Failed to process {match_id}: {e}")
             continue

@@ -514,6 +514,8 @@ def get_match_detail(match_id: str, game_name: str, tag_line: str) -> dict:
     raw_units = get_units_for_match(match_id)
     raw_traits = get_traits_for_match(match_id)
     trait_data = build_trait_data(set_number)
+    champion_data = build_champion_data(set_number)
+    used_character_ids = {character_id for character_id, star_level, items_string in raw_units}
 
     traits_display = []
 
@@ -538,14 +540,27 @@ def get_match_detail(match_id: str, game_name: str, tag_line: str) -> dict:
             color = trait_style_color(display_style)
 
         tooltip = resolve_trait_breakpoints(trait_static_lookup.get(trait_name), num_units)
+
+        roster = []
+        if trait_info:
+            trait_display_name = trait_info["name"]
+            for cid, champ in champion_data.items():
+                if trait_display_name in (champ.get("traits") or []):
+                    roster.append({
+                        "name": champ.get("name", cid),
+                        "icon_url": tex_path_to_url(champ["squareIcon"]) if champ.get("squareIcon") else None,
+                        "used_this_match": cid in used_character_ids,
+                    })
+            roster.sort(key=lambda u: (not u["used_this_match"], u["name"]))
+
         traits_display.append({
             "name": name,
             "icon_url": icon_url,
             "color": color,
             "num_units": num_units,
             "tooltip": tooltip,
+            "roster": roster,
         })
-    champion_data = build_champion_data(set_number)
     item_data = build_item_data()
     metatft_items = get_metatft_item_lookup()
     metatft_item_names = get_metatft_item_name_lookup()

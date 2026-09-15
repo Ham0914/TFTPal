@@ -1,7 +1,7 @@
 import time
 from database import create_tables, save_match, get_connection
 from fetch_match import get_puuid, get_recent_match_ids, get_match_details, GAME_NAME, TAG_LINE, REGION
-from rank import get_current_rank
+from rank import get_rank_for_match_queue
 import requests
 
 POLL_INTERVAL_SECONDS = 90  # how often to check for a new match
@@ -32,7 +32,14 @@ def watch(puuid: str):
             for match_id in new_ids:
                 print(f"\nNew match detected: {match_id}")
                 match_data = get_match_details(match_id, REGION)
-                rank_info = get_current_rank(puuid)
+                match_queue_id = match_data["info"]["queueId"]
+
+                try:
+                    rank_info = get_rank_for_match_queue(puuid, match_queue_id)
+                except requests.exceptions.HTTPError as e:
+                    print(f"⚠️  Couldn't fetch current rank ({e}) — saving this match without one.")
+                    rank_info = None
+
                 save_match(match_data, puuid, rank_info=rank_info)
                 print(f"Saved with rank snapshot: {rank_info}")
 
