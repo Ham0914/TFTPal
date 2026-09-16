@@ -1,12 +1,15 @@
 import random
 import streamlit as st
-from stats import average_placement, top4_rate, win_rate, placement_breakdown, most_played_units, match_history
-from fetch_match import GAME_NAME, TAG_LINE
-from database import get_game
+from stats import average_placement, top4_rate, win_rate, placement_breakdown, most_played_units, most_played_traits, match_history
+from fetch_match import GAME_NAME, TAG_LINE, REGION, get_puuid, get_recent_match_ids, get_match_details
+from rank import get_rank_for_match_queue
+from database import get_game, get_connection, save_match, create_tables
 from match_detail import placement_color
 from match_detail import get_match_detail, time_ago, ordinal
 from match_detail import get_metatft_champion_lookup, resolve_metatft_markup, clean_game_text
+from match_detail import resolve_trait_breakpoints, trait_style_color, corrected_trait_style
 from game_data import build_champion_data, tex_path_to_url, build_companion_lookup, companion_icon_url
+from game_data import build_trait_data, build_trait_static_data
 from metatft_rating import fetch_rating_history, short_rank_label
 import altair as alt
 import pandas as pd
@@ -33,6 +36,102 @@ def _rating_queue_for_filter(selected_queue_id):
     if selected_queue_id == 1090:
         return None, None
     return 1100, "Ranked"
+
+
+@st.cache_resource
+def _cached_puuid(game_name: str, tag_line: str, region: str) -> str:
+    # PUUID never changes for a given Riot ID, so this is safe to cache for
+    # the life of the server process rather than re-hitting the Account API
+    # on every refresh-button click.
+    return get_puuid(game_name, tag_line, region)
+
+
+def refresh_player_matches() -> dict:
+    """
+    Manual "catch me up" action for the Refresh button: checks the most
+    recent matches on Riot's side, saves any not already in the database
+    (with a rank snapshot, same as watcher.py does), and reports what
+    happened so the button can show a real result instead of just
+    disappearing. Returns {"new_matches": int} on success, or
+    {"error": str} if something failed (e.g. an expired Riot API key) —
+    deliberately caught here rather than left to crash the whole page,
+    since this runs from a button click, not app startup.
+    """
+    try:
+        create_tables()
+        puuid = _cached_puuid(GAME_NAME, TAG_LINE, REGION)
+
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT match_id FROM games")
+        saved_ids = {row[0] for row in cursor.fetchall()}
+        conn.close()
+
+        # 20 is a middle ground between watcher.py's count=5 (fine for a
+        # process polling every 90s, too shallow if the app hasn't been
+        # opened in a while) and fetch_match.py's full-sync count=30 (more
+        # thorough than a manual "check for anything new" click needs).
+        recent_ids = get_recent_match_ids(puuid, REGION, count=20)
+        new_ids = [mid for mid in recent_ids if mid not in saved_ids]
+
+        rank_cache = {}
+        for match_id in new_ids:
+            match_data = get_match_details(match_id, REGION)
+            match_queue_id = match_data["info"]["queueId"]
+            if match_queue_id not in rank_cache:
+                try:
+                    rank_cache[match_queue_id] = get_rank_for_match_queue(puuid, match_queue_id)
+                except Exception:
+                    rank_cache[match_queue_id] = None
+            save_match(match_data, puuid, rank_info=rank_cache[match_queue_id])
+
+        return {"new_matches": len(new_ids)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _dismissible_alert(text: str, kind: str = "info") -> None:
+    """
+    Like st.info/warning/success/error, but auto-fades after ~10s (see the
+    .tft-alert-fade-a/-b CSS animations) — which native st.info etc. can't
+    do reliably here. Confirmed live via DevTools, in three rounds:
+
+    1. A CSS animation on native st.info/warning/etc.'s own
+       [data-testid="stAlert"] only ever plays once: Streamlit patches that
+       element's text in place across reruns rather than creating a fresh
+       DOM node, so on a second click within 10.5s of the first, the "new"
+       alert appeared already faded — the browser considered the animation
+       (tied to that one persistent element) already finished.
+    2. Assumed switching to a custom st.markdown div would fix it by
+       forcing a full innerHTML replacement (destroying/recreating the
+       node) — verified via a standalone innerHTML test that this DOES
+       correctly restart a CSS animation in general. But Streamlit's own
+       markdown renderer turned out not to work that way: per
+       getAnimations()[0].currentTime, even a div with a fresh data-ts
+       attribute (proving new HTML was sent) came back already finished —
+       Streamlit is patching attributes/text on the SAME persistent node
+       here too, not replacing it outright.
+    3. Real fix: alternate which of two CSS classes (identical styling,
+       different @keyframes NAME) gets applied each call. Verified via a
+       standalone test that changing an element's animation-name restarts
+       its animation from 0 even when it's the exact same DOM node — so
+       this works regardless of whether Streamlit reuses the node.
+    """
+    colors = {
+        "info": ("#5b9bd5", "rgba(44,141,224,0.12)"),
+        "warning": ("var(--tft-gold)", "rgba(212,175,55,0.12)"),
+        "success": ("#3ba55c", "rgba(59,165,92,0.12)"),
+        "error": ("#e05a5a", "rgba(192,57,43,0.12)"),
+    }
+    color, bg = colors.get(kind, colors["info"])
+    toggle = 1 - st.session_state.get("_alert_variant_toggle", 0)
+    st.session_state["_alert_variant_toggle"] = toggle
+    variant_class = "tft-alert-fade-a" if toggle == 0 else "tft-alert-fade-b"
+    st.markdown(
+        "<div class='" + variant_class + "' style='background:" + bg + ";color:" + color + ";"
+        "border-radius:8px;padding:12px 16px;font-size:14px;margin-bottom:8px;'>" + text + "</div>",
+        unsafe_allow_html=True,
+    )
 
 # --- Icons (hand-drawn inline SVGs — no dedicated Riot/tactics.tools asset
 # exists for generic dashboard concepts like "placement" or "damage", and a
@@ -61,18 +160,51 @@ st.markdown("""
         --tft-border: #2e323d;
     }
 
+    /* No background-color on .stApp itself — verified live via DevTools that
+       a solid background-color here paints UNDER any z-index:-1 child (the
+       classic "negative z-index disappears behind the parent's own
+       background" trap). That's why this hex/vignette layer AND the
+       pre-existing hero-splash backdrop (previously its own separate
+       .stApp::before) were both completely invisible before this fix — not
+       just too subtle, literally never painted. The two are now combined
+       into a single dynamically-built ::before (see the hero-splash section
+       below) instead of two competing negative-z-index pseudo-elements, so
+       there's only one stacking order to reason about. The actual layers
+       (vignette, hex tile, optional splash) are built dynamically in Python
+       right after the hero splash is chosen, below, since the hex lines need
+       to be positioned ABOVE the splash-darkening veil in the same layer
+       stack to stay visible as a texture over it — on separate pseudo-
+       elements, the veil (nearly opaque, needed to darken a full-brightness
+       splash to a tasteful level) completely hid the hex tile beneath it. */
     .stApp {
-        background-color: var(--tft-bg-deep);
-    }
-    .stApp::after {
-        content: ""; position: fixed; inset: 0; z-index: -1;
-        background: radial-gradient(ellipse at top, rgba(20,23,31,0.55) 0%, var(--tft-bg-deep) 70%);
+        background-color: transparent;
+        /* Makes the --hero-vis named view-timeline (declared on
+           #tft-hero-card below) visible to the compact sticky bar too, even
+           though that bar lives elsewhere in the tree (a sibling markdown
+           block, not a descendant of the card) — without this, a named
+           view-timeline is only visible to the declaring element's own
+           descendants per spec, and the compact bar's animation-timeline
+           reference silently fails to resolve. Confirmed live via DevTools:
+           opacity stayed frozen at the wrong value at every scroll position
+           until this was added. */
+        timeline-scope: --hero-vis;
     }
 
-    h1, h2, h3 { letter-spacing: 0.5px; }
+    /* padding-bottom needs !important — confirmed live via DevTools that
+       Streamlit's own default h2/h3 padding-bottom (16px) was winning over
+       a plain override here, and separately that .tft-divider's own
+       margin (below) was being completely ignored the same way, for the
+       same reason: Streamlit's built-in element styles load in a way that
+       wins the cascade despite equal/lower specificity. Together these
+       two defaults (16px heading padding + 32px hr margin-top) were the
+       real source of the oversized gap between a heading/selector row and
+       the divider line under it — tightened here without touching the
+       flex gap Streamlit puts BETWEEN elements generally, which is what
+       supplies the (intentionally kept) larger space ABOVE each heading. */
+    h1, h2, h3 { letter-spacing: 0.5px; text-shadow: 0 2px 6px rgba(0,0,0,0.6); padding-bottom: 4px !important; }
 
     .tft-divider {
-        height: 2px; margin: 4px 0 18px 0; border: none;
+        height: 2px; margin: 2px 0 18px 0 !important; border: none;
         background: linear-gradient(90deg, var(--tft-gold) 0%, rgba(212,175,55,0.08) 70%, transparent 100%);
     }
 
@@ -94,8 +226,29 @@ st.markdown("""
 
     details.tft-card {
         border-radius: 10px !important;
-        background: linear-gradient(180deg, var(--tft-bg-panel) 0%, #10131a 100%) !important;
+        /* Was a fully-opaque hex gradient (100% solid, blocking the backdrop
+           entirely) — switched to the same semi-opaque rgba level as the
+           st.container(border=True) boxes below, so every "card" on the
+           page reads consistently rather than match history alone being
+           fully solid while everything else was fully transparent. */
+        background: linear-gradient(180deg, rgba(20,23,31,0.7) 0%, rgba(16,19,26,0.7) 100%) !important;
         box-shadow: 0 2px 10px rgba(0,0,0,0.35);
+    }
+    /* st.container(border=True) boxes (Last N Games, the two charts, Most
+       Played Units) render as a plain stVerticalBlock with Streamlit's own
+       default border and a fully transparent background — against the
+       hextech backdrop they read as invisible outlines. There's no stable
+       official data-testid for "this vertical block is the bordered-
+       container kind" in this Streamlit version (no separate
+       stVerticalBlockBorderWrapper like older versions had), so this
+       targets the emotion-cache class Streamlit currently generates for it
+       specifically — confirmed live via DevTools that all 4 bordered boxes
+       on this page share this exact class and no unbordered block does.
+       Fragile against a Streamlit version upgrade changing that generated
+       class; if these boxes lose their fill after an upgrade, re-inspect
+       and update the class name here. */
+    div[data-testid="stVerticalBlock"].st-emotion-cache-1fpp8sd {
+        background: rgba(20,23,31,0.7);
     }
     details.tft-card summary { list-style: none; }
     details.tft-card summary::-webkit-details-marker { display: none; }
@@ -163,8 +316,113 @@ st.markdown("""
     }
     div[data-testid="stSelectbox"] svg { fill: var(--tft-gold) !important; }
 
+    /* The little "Press Enter to submit form" / "Press Enter to apply"
+       hint Streamlit shows under a text input while it has unsaved
+       changes — official stable testid, no fragile emotion-cache class
+       needed here. */
+    [data-testid="InputInstructions"] { display: none; }
+
+    /* !important is needed because each nav item's color/border are set
+       inline (per-item, active vs inactive) — a plain :hover class rule
+       can't outrank an inline style's specificity without it. */
+    .tft-nav-item { transition: color 0.15s ease, border-color 0.15s ease; }
+    .tft-nav-item:hover { color: var(--tft-gold) !important; border-bottom-color: var(--tft-gold) !important; }
+
+    /* Auto-dismiss for the search/refresh feedback messages — stays fully
+       visible for ~10s, then fades over the last 0.5s. Pure CSS,
+       deliberately not a JS setTimeout: plain <script> tags inside
+       st.markdown(unsafe_allow_html=True) never execute (browsers don't
+       run scripts inserted via innerHTML), and the real fix for that —
+       st.components.v1.html's cross-frame DOM hack — was already tried
+       for a different feature in this app and cost three rounds of blind
+       iteration before being abandoned.
+       TWO identical-looking classes, not one: confirmed live via DevTools
+       (getAnimations()[0].currentTime) that Streamlit patches this element
+       in place across reruns rather than replacing it — even attaching a
+       constantly-changing data-ts attribute to prove fresh HTML was sent
+       didn't help, the animation still came back already finished on a
+       second trigger. What DOES reliably restart a CSS animation on a
+       persistent, never-recreated node is changing the animation-name
+       itself — verified with a standalone test. _dismissible_alert
+       alternates the class between these two on every call for exactly
+       that reason; don't collapse them back into one class + one
+       @keyframes without re-verifying, it'll silently reintroduce the
+       "second click shows nothing" bug. */
+    .tft-alert-fade-a { animation: tft-alert-fade-a 10.5s ease forwards; }
+    .tft-alert-fade-b { animation: tft-alert-fade-b 10.5s ease forwards; }
+    @keyframes tft-alert-fade-a {
+        0%, 95% { opacity: 1; }
+        100% { opacity: 0; pointer-events: none; }
+    }
+    @keyframes tft-alert-fade-b {
+        0%, 95% { opacity: 1; }
+        100% { opacity: 0; pointer-events: none; }
+    }
+
     #tft-hero-card {
-        min-height: 250px; border-radius: 14px; overflow: hidden;
+        /* position:relative is load-bearing, not decorative: without it this
+           element is position:static, so its position:absolute children
+           (inset:0 overlay, top/left text blocks) fall back to the nearest
+           positioned ancestor — none exists here, so they end up positioned
+           against the viewport instead. overflow:hidden still clips their
+           painted content down to this element's own rectangle either way
+           (that clip doesn't require a matching containing block), which is
+           why layout looked correct — but verified live via DevTools that
+           the ROUNDED part of that clip does not reliably apply when the
+           containing block differs from the overflow:hidden ancestor,
+           leaving square corners on the background/overlay despite the
+           rectangle being right. Same element for both fixes it outright. */
+        position: relative;
+        min-height: 278px; border-radius: 14px; overflow: hidden;
+        /* "Floating" look: a soft, deep, offset-down shadow reads as the
+           card being lifted off the page (the farther/softer a shadow, the
+           higher something looks like it's floating), plus a hairline
+           highlight along the very top edge for a subtle raised-bevel cue —
+           the same trick under most "elevated card" design systems. Both
+           are plain box-shadow entries so overflow:hidden (which only clips
+           this element's own painted content, never its shadow) doesn't
+           affect them. */
+        box-shadow:
+            0 28px 48px -16px rgba(0,0,0,0.65),
+            0 10px 20px rgba(0,0,0,0.4),
+            inset 0 1px 0 rgba(255,255,255,0.07);
+        /* Named view-timeline tracking this card's own scroll position —
+           consumed by #tft-hero-compact below to know when to reveal
+           itself. axis:block = vertical scroll, which is what we want to
+           track regardless of the element's horizontal position. */
+        view-timeline-name: --hero-vis;
+        view-timeline-axis: block;
+    }
+
+    /* The shortened sticky bar shown once the full hero card has scrolled
+       out of view. position:fixed (not sticky) deliberately — sticky only
+       stays pinned while its own immediate parent is still scrolling past,
+       and Streamlit wraps every st.markdown() output in a wrapper that
+       hugs its content tightly (no extra height for a sticky element to
+       "travel" within), confirmed live via DevTools (opacity/position froze
+       after ~100px of scroll instead of staying pinned for the whole page).
+       Fixed positioning has no such constraint. Visibility is driven purely
+       by the --hero-vis scroll-linked animation below — no JS. */
+    #tft-hero-compact {
+        position: fixed; top: 60px; left: 0; right: 0; z-index: 999000;
+        opacity: 0; pointer-events: none;
+        animation-name: tft-hero-compact-reveal;
+        animation-duration: 1ms; /* actual "duration" comes from animation-range below, not real time */
+        animation-fill-mode: both;
+        animation-timing-function: linear;
+        animation-timeline: --hero-vis;
+        /* Reveal while the original card is exiting the top of the
+           viewport, finishing well before it's fully gone so there's no
+           gap where neither version is visible. Tuned live against real
+           scrolling — a wider range (exit 0%/60%) left a longer stretch
+           where both versions were simultaneously mid-fade and visibly
+           overlapping; this is snappier. */
+        animation-range: exit 0% exit 35%;
+    }
+    @keyframes tft-hero-compact-reveal {
+        0% { opacity: 0; transform: translateY(-8px); }
+        99% { pointer-events: none; }
+        100% { opacity: 1; transform: translateY(0); pointer-events: auto; }
     }
 
     .tft-stat-tile {
@@ -188,7 +446,10 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # --- Hero splash: a random Set 18 champion, refreshed each page load.
-# Reused both for the banner and (very darkened) as the page backdrop. ---
+# Used for the player card AND the compact scroll bar (same champion in
+# both, so the identity feels continuous as you scroll) — the full-page
+# backdrop deliberately gets an INDEPENDENT random pick (bg_champion,
+# below) so the two don't just show the same picture twice. ---
 _champion_data = build_champion_data()
 _splash_candidates = [
     c for c in _champion_data.values()
@@ -199,14 +460,67 @@ if "hero_champion" not in st.session_state:
 _hero = st.session_state["hero_champion"]
 _hero_splash = tex_path_to_url(_hero["icon"]) if _hero else None
 
-if _hero_splash:
-    st.markdown(
-        "<style>.stApp::before { content: \"\"; position: fixed; inset: 0; z-index: -1; "
-        "background-image: url(" + _hero_splash + "); background-size: cover; "
-        "background-position: center 20%; background-attachment: fixed; "
-        "opacity: 0.14; filter: saturate(0.6); }</style>",
-        unsafe_allow_html=True,
-    )
+# Independent random pick for the full-page backdrop — excludes whichever
+# champion the card/compact bar already picked so the two are never the
+# same picture (falls back to allowing a repeat only if there's just one
+# candidate to choose from at all).
+if "bg_champion" not in st.session_state:
+    _bg_candidates = [c for c in _splash_candidates if c is not _hero] or _splash_candidates
+    st.session_state["bg_champion"] = random.choice(_bg_candidates) if _bg_candidates else None
+_bg_hero = st.session_state["bg_champion"]
+_bg_splash = tex_path_to_url(_bg_hero["icon"]) if _bg_hero else None
+
+# Page backdrop: vignette + a pure-CSS hex tile, always on, plus a darkened
+# splash image when a hero was chosen. All in one layer stack (not split
+# across pseudo-elements) so the hex lines can sit ABOVE the splash-darkening
+# veil and stay visible as a texture over it — tried on separate elements
+# first, and a veil dark enough to tame a full-brightness splash to a tasteful
+# level (verified live: needs ~0.82 alpha) fully hid a hex tile stacked
+# beneath it. Line alpha is much lower than it needs to be against a flat
+# dark base (0.06/0.045 there) because it gains a lot of extra visual
+# contrast sitting above a bright, uneven splash image instead — verified
+# live side by side, 0.06/0.045 read as a loud, busy cube pattern once the
+# splash was underneath it. Each tuple is (image, size, position); "fixed"
+# attachment on all layers matches the old splash-only behavior.
+_HEX_LINE = "rgba(212,175,55,0.025)"
+_HEX_LINE_DIM = "rgba(212,175,55,0.018)"
+# Hex tile layers temporarily removed at the user's request, to see the
+# backdrop as just the darkened splash image with no texture overlay. The
+# six-gradient honeycomb tile is still built the same way (see the
+# _HEX_LINE/_HEX_LINE_DIM constants above and git history for the exact
+# layers) — reintroduce by adding them back into _bg_layers below the
+# vignette if the plain-image look doesn't win out.
+_bg_layers = [
+    # Flat wash on top of everything else in this stack — added after the
+    # user found the textured backdrop made body text harder to read than
+    # the old flat background. Darkens the vignette and splash uniformly
+    # (site-wide, not just inside cards) without erasing them; tuned live
+    # side by side against the un-washed version before picking 0.35 as
+    # visibly more readable while still showing the image through.
+    ("linear-gradient(rgba(6,7,10,0.35), rgba(6,7,10,0.35))", "100% 100%", "0 0"),
+    ("radial-gradient(ellipse at top, rgba(20,23,31,0.55) 0%, transparent 70%)", "100% 100%", "0 0"),
+]
+if _bg_splash:
+    _bg_layers.append(("linear-gradient(rgba(10,12,16,0.82), rgba(10,12,16,0.82))", "cover", "center 20%"))
+    _bg_layers.append(('url("' + _bg_splash + '")', "cover", "center 20%"))
+    _before_extra = "filter: saturate(0.6);"
+else:
+    _before_extra = ""
+
+_before_bg_image = ",\n            ".join(layer[0] for layer in _bg_layers)
+_before_bg_size = ", ".join(layer[1] for layer in _bg_layers)
+_before_bg_position = ", ".join(layer[2] for layer in _bg_layers)
+
+st.markdown(
+    "<style>.stApp::before { content: \"\"; position: fixed; inset: 0; z-index: -1; "
+    "background-color: var(--tft-bg-deep); "
+    "background-image: " + _before_bg_image + "; "
+    "background-size: " + _before_bg_size + "; "
+    "background-position: " + _before_bg_position + "; "
+    "background-attachment: fixed; "
+    + _before_extra + " }</style>",
+    unsafe_allow_html=True,
+)
 
 # --- Game mode filter lives in the sidebar — kept out of the hero/player
 # card entirely, always visible, never competes for space with it. ---
@@ -241,8 +555,58 @@ RANK_COLORS = {
     "MASTER": "#b362ff", "GRANDMASTER": "#ff5c5c", "CHALLENGER": "#ffe680",
 }
 
+# Verified with Pillow (scanned for non-transparent, non-near-white pixels):
+# each tier's ranked-emblem PNG is a small crest sitting in a mostly-empty
+# canvas, and neither the canvas size nor the crest's position/size within it
+# is consistent across tiers (most are 1280x720, Platinum/Emerald are
+# 2560x1440; the crest itself ranges from ~195x117 to ~579x429). Displaying
+# the raw image at icon size — or even with object-fit:cover — showed only a
+# tiny, mostly-empty-looking sliver, since the crest occupies well under a
+# third of the canvas either way. Values are
+# (canvas_w, canvas_h, crest_x, crest_y, crest_w, crest_h) per tier, used to
+# crop tightly to just the crest via a scaled, offset CSS background-image
+# instead of the <img> itself.
+RANK_EMBLEM_CROP = {
+    "IRON": (1280, 720, 544, 298, 195, 117),
+    "BRONZE": (1280, 720, 524, 276, 233, 153),
+    "SILVER": (1280, 720, 512, 248, 255, 179),
+    "GOLD": (1280, 720, 512, 238, 255, 215),
+    "PLATINUM": (2560, 1440, 1018, 448, 525, 443),
+    "EMERALD": (2560, 1440, 992, 460, 579, 429),
+    "DIAMOND": (1280, 720, 486, 264, 311, 185),
+    "MASTER": (1280, 720, 492, 238, 297, 215),
+    "GRANDMASTER": (1280, 720, 486, 242, 309, 221),
+    "CHALLENGER": (1280, 720, 482, 220, 319, 239),
+}
+
+def _rank_emblem_html(rank_tier: str, height: int) -> str:
+    url = "https://raw.communitydragon.org/latest/plugins/rcp-fe-lol-static-assets/global/default/images/ranked-emblem/emblem-" + rank_tier.lower() + ".png"
+    crop = RANK_EMBLEM_CROP.get(rank_tier.upper())
+    if not crop:
+        return "<img src='" + url + "' style='width:" + str(height) + "px;height:" + str(height) + "px;vertical-align:-" + str(round(height * 0.27)) + "px;margin-right:6px;' />"
+    canvas_w, canvas_h, crest_x, crest_y, crest_w, crest_h = crop
+    scale = height / crest_h
+    width = round(crest_w * scale)
+    return (
+        "<span style='display:inline-block;width:" + str(width) + "px;height:" + str(height) + "px;"
+        "background-image:url(" + url + ");background-size:" + str(round(canvas_w * scale)) + "px " + str(round(canvas_h * scale)) + "px;"
+        "background-position:-" + str(round(crest_x * scale)) + "px -" + str(round(crest_y * scale)) + "px;"
+        "vertical-align:-" + str(round(height * 0.27)) + "px;margin-right:6px;'></span>"
+    )
+
 avatar_url = None
-rank_html = "<span style='color:#888;'>Not tracked for this game</span>"
+
+def _rank_html(icon_height: int) -> str:
+    if not rank_tier:
+        return "<span style='color:#888;'>Not tracked for this game</span>"
+    rank_color = RANK_COLORS.get(rank_tier.upper(), "#d4af37")
+    return (
+        _rank_emblem_html(rank_tier, icon_height)
+        + "<span style='color:" + rank_color + ";font-weight:700;'>" + rank_tier.title() + " " + (rank_division or "") + "</span>"
+        + "<span style='color:#aaa;margin-left:6px;'>" + str(league_points or 0) + " LP</span>"
+    )
+
+rank_tier = rank_division = league_points = None
 if history_for_card:
     latest_game = get_game(history_for_card[0][0])
     (_, _, _, _, _, _, _, _, rank_tier, rank_division, league_points, _,
@@ -252,20 +616,19 @@ if history_for_card:
     if companion_info:
         avatar_url = companion_icon_url(companion_info["loadoutsIcon"])
 
-    if rank_tier:
-        rank_emblem = f"https://raw.communitydragon.org/latest/plugins/rcp-fe-lol-static-assets/global/default/images/ranked-emblem/emblem-{rank_tier.lower()}.png"
-        rank_color = RANK_COLORS.get(rank_tier.upper(), "#d4af37")
-        rank_html = (
-            "<img src='" + rank_emblem + "' style='width:26px;height:26px;vertical-align:-7px;margin-right:6px;' />"
-            "<span style='color:" + rank_color + ";font-weight:700;'>" + rank_tier.title() + " " + (rank_division or "") + "</span>"
-            "<span style='color:#aaa;margin-left:6px;'>" + str(league_points or 0) + " LP</span>"
+def _avatar_html(size: int) -> str:
+    if avatar_url:
+        return (
+            "<img src='" + avatar_url + "' style='width:" + str(size) + "px;height:" + str(size) + "px;"
+            "border-radius:50%;border:3px solid var(--tft-gold);object-fit:cover;object-position:center 30%;"
+            "box-shadow:0 2px 12px rgba(0,0,0,0.6);' />"
         )
+    return (
+        "<div style='width:" + str(size) + "px;height:" + str(size) + "px;border-radius:50%;"
+        "border:3px solid var(--tft-gold);background:var(--tft-bg-raised);'></div>"
+    )
 
-avatar_html = (
-    "<img src='" + avatar_url + "' style='width:92px;height:92px;border-radius:50%;border:3px solid var(--tft-gold);object-fit:cover;object-position:center 30%;box-shadow:0 2px 12px rgba(0,0,0,0.6);' />"
-    if avatar_url else
-    "<div style='width:92px;height:92px;border-radius:50%;border:3px solid var(--tft-gold);background:var(--tft-bg-raised);'></div>"
-)
+avatar_html = _avatar_html(92)
 
 def _stat_tile(value: str, label: str, value_color: str = None) -> str:
     color_style = f"color:{value_color};" if value_color else ""
@@ -296,6 +659,29 @@ stats_html = (
     + _stat_tile(lp_change_value, "Last 10 Games", lp_change_color)
 )
 
+# Placeholder site nav — this page isn't the site's home page, it's the
+# "Player Stats" page of a future multi-page site, so the active item
+# reflects that. Labels are inert (no href/routing) until there's an
+# actual second page for them to go to; text only, per what was asked for.
+NAV_ITEMS = ["Home", "Player Stats", "Leaderboards", "About"]
+NAV_ACTIVE_ITEM = "Player Stats"
+
+def _nav_html(font_size: int = 13, gap: int = 22) -> str:
+    items_html = ""
+    for item in NAV_ITEMS:
+        is_active = item == NAV_ACTIVE_ITEM
+        color = "var(--tft-gold)" if is_active else "rgba(255,255,255,0.65)"
+        weight = "700" if is_active else "500"
+        # Inactive items get a transparent border-bottom (not "none") so
+        # the hover state can swap it to gold without the text shifting —
+        # same 2px reserved either way, just invisible until hovered.
+        underline = "border-bottom:2px solid var(--tft-gold);" if is_active else "border-bottom:2px solid transparent;"
+        items_html += (
+            "<span class='tft-nav-item' style='color:" + color + ";font-weight:" + weight + ";font-size:" + str(font_size) + "px;"
+            "letter-spacing:0.5px;cursor:default;white-space:nowrap;padding-bottom:4px;" + underline + "'>" + item + "</span>"
+        )
+    return "<div style='display:flex;gap:" + str(gap) + "px;align-items:center;'>" + items_html + "</div>"
+
 if _hero_splash:
     hero_bg_style = "background-image:url(" + _hero_splash + ");background-size:cover;background-position:center 20%;"
 else:
@@ -304,17 +690,21 @@ else:
 hero_card_html = (
     "<div id='tft-hero-card' style='" + hero_bg_style +
     "border:1px solid var(--tft-border);margin-bottom:24px;'>"
-    "<div style='position:absolute;inset:0;background:linear-gradient(100deg, rgba(10,12,16,0.94) 32%, rgba(10,12,16,0.6) 68%, rgba(10,12,16,0.3) 100%);'></div>"
+    "<div style='position:absolute;inset:0;border-radius:inherit;background:linear-gradient(100deg, rgba(10,12,16,0.94) 32%, rgba(10,12,16,0.6) 68%, rgba(10,12,16,0.3) 100%);'></div>"
 
-    "<div style='position:absolute;top:26px;left:28px;'>"
+    "<div style='position:absolute;top:0;left:0;right:0;padding:12px 28px;display:flex;justify-content:center;background:linear-gradient(rgba(6,7,10,0.55), transparent);'>"
+    + _nav_html() +
+    "</div>"
+
+    "<div style='position:absolute;top:54px;left:28px;'>"
     "<div style='font-size:30px;font-weight:800;color:#fff;letter-spacing:1px;text-shadow:0 2px 8px rgba(0,0,0,0.8);'>TFT COACH</div>"
     "<div style='font-size:13px;color:var(--tft-gold);letter-spacing:2px;text-transform:uppercase;'>Set 18 &middot; Enchanted Wilds</div>"
     "</div>"
 
-    "<div style='position:absolute;top:26px;right:28px;display:flex;align-items:center;gap:14px;'>"
+    "<div style='position:absolute;top:54px;right:28px;display:flex;align-items:center;gap:14px;'>"
     "<div style='text-align:right;'>"
     "<div style='font-size:24px;'><b style='color:#fff;'>" + GAME_NAME + "</b><span style='color:#aaa;'>#" + TAG_LINE + "</span></div>"
-    "<div style='margin-top:6px;font-size:16px;'>" + rank_html + "</div>"
+    "<div style='margin-top:6px;font-size:16px;display:flex;align-items:center;'>" + _rank_html(38) + "</div>"
     "</div>"
     + avatar_html +
     "</div>"
@@ -326,6 +716,71 @@ hero_card_html = (
     "</div>"
 )
 st.markdown(hero_card_html, unsafe_allow_html=True)
+
+# Shortened sticky version of the card above (title + name/rank/avatar,
+# no stat tiles) — hidden until the full card scrolls out of view, then
+# pinned to the top of the page. See the #tft-hero-compact / --hero-vis
+# CSS (in the main stylesheet block) for how the reveal itself works;
+# this just builds the smaller reused content.
+hero_compact_html = (
+    "<div id='tft-hero-compact' style='" + hero_bg_style +
+    "border-bottom:1px solid var(--tft-border);'>"
+    "<div style='position:absolute;inset:0;background:linear-gradient(100deg, rgba(10,12,16,0.96) 40%, rgba(10,12,16,0.75) 68%, rgba(10,12,16,0.55) 100%);'></div>"
+
+    # Grid (not flex space-between) so the nav stays perfectly centered
+    # regardless of how wide the title vs. identity blocks on either side
+    # are — a middle flex child can't do that without extra wrapper markup.
+    "<div style='position:relative;display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:12px 28px;'>"
+    "<div>"
+    "<div style='font-size:19px;font-weight:800;color:#fff;letter-spacing:0.5px;text-shadow:0 2px 8px rgba(0,0,0,0.8);'>TFT COACH</div>"
+    "<div style='font-size:11px;color:var(--tft-gold);letter-spacing:1.5px;text-transform:uppercase;'>Set 18 &middot; Enchanted Wilds</div>"
+    "</div>"
+
+    + _nav_html(font_size=12, gap=18) +
+
+    "<div style='display:flex;align-items:center;gap:12px;justify-self:end;'>"
+    "<div style='text-align:right;'>"
+    "<div style='font-size:17px;'><b style='color:#fff;'>" + GAME_NAME + "</b><span style='color:#aaa;'>#" + TAG_LINE + "</span></div>"
+    "<div style='margin-top:2px;font-size:13px;display:flex;align-items:center;justify-content:flex-end;'>" + _rank_html(26) + "</div>"
+    "</div>"
+    + _avatar_html(44) +
+    "</div>"
+
+    "</div>"
+)
+st.markdown(hero_compact_html, unsafe_allow_html=True)
+
+# --- Player search (UI only for now — searching an arbitrary player isn't
+# wired up yet, this just reserves the spot and gives real input feedback
+# instead of doing nothing) + a real, working manual refresh. ---
+col_search, col_refresh = st.columns([5, 1.3], vertical_alignment="top")
+with col_search:
+    with st.form("player_search_form", clear_on_submit=False, border=False):
+        search_col_input, search_col_button = st.columns([5, 1])
+        with search_col_input:
+            search_query = st.text_input(
+                "Search for a player", placeholder="Search for a player (Riot ID, e.g. Name#TAG)",
+                label_visibility="collapsed",
+            )
+        with search_col_button:
+            search_submitted = st.form_submit_button("Search", use_container_width=True)
+    if search_submitted:
+        if search_query.strip():
+            _dismissible_alert("Player search is coming soon — for now this page only tracks " + GAME_NAME + "#" + TAG_LINE + ".", "info")
+        else:
+            _dismissible_alert("Type a Riot ID to search for.", "warning")
+
+with col_refresh:
+    if st.button("Refresh Stats", use_container_width=True):
+        with st.spinner("Checking for new matches..."):
+            result = refresh_player_matches()
+        if "error" in result:
+            _dismissible_alert("Couldn't refresh: " + result["error"], "error")
+        elif result["new_matches"] > 0:
+            _dismissible_alert(f"Fetched {result['new_matches']} new match(es).", "success")
+            st.rerun()
+        else:
+            _dismissible_alert("Up to date", "info")
 
 # --- Placement breakdown ---
 col_heading, col_mode = st.columns([3, 1], vertical_alignment="bottom")
@@ -360,6 +815,17 @@ if last_n_games:
         st.markdown("<div style='color:#999;font-size:12px;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px;'>Last " + str(len(last_n_games)) + " Games</div>", unsafe_allow_html=True)
         st.markdown(grid_html, unsafe_allow_html=True)
 
+def _chart_placeholder_html(text: str) -> str:
+    # 336px, not the chart's declared height=320 — measured live via
+    # DevTools that Altair/Vega-Lite renders taller than the declared plot
+    # height once axis tick labels and the axis title are added underneath
+    # it, so matching 320 exactly left this box 16px shorter than its
+    # sibling chart box.
+    return (
+        "<div style='height:336px;display:flex;align-items:center;justify-content:center;"
+        "color:#888;font-size:14px;text-align:center;'>" + text + "</div>"
+    )
+
 # --- Placement bar chart + rank progression line chart, side by side ---
 col_bar, col_line = st.columns(2)
 
@@ -388,7 +854,7 @@ with col_line:
             st.markdown("<div style='color:#999;font-size:12px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;'>LP Progression</div>", unsafe_allow_html=True)
         rating_history = _cached_rating_history(GAME_NAME, TAG_LINE, queue_id=_rating_queue_id) if _rating_queue_id else []
         if not _rating_queue_id:
-            st.caption("Normal games have no ranked ladder.")
+            st.markdown(_chart_placeholder_html("Normal games have no ranked ladder."), unsafe_allow_html=True)
         elif rating_history:
             rating_values = [r["rating_numeric"] for r in rating_history]
             rating_df = pd.DataFrame({
@@ -420,13 +886,26 @@ with col_line:
             ).properties(height=320, background="transparent").configure_view(strokeWidth=0)
             st.altair_chart(line_chart, use_container_width=True)
         else:
-            st.caption("Rank history unavailable right now.")
+            st.markdown(_chart_placeholder_html("Rank history unavailable right now."), unsafe_allow_html=True)
 
-# --- Most played units ---
-st.subheader("Most Played Units")
+# --- Most played units + traits, side by side ---
+col_mp_heading, col_mp_sort = st.columns([3, 1], vertical_alignment="bottom")
+with col_mp_heading:
+    # Reads session_state from BEFORE the selectbox below (re-)declares it
+    # this run — same pattern as game_mode_select elsewhere in this file:
+    # Streamlit restores session_state at the top of a rerun, so this
+    # already reflects whatever was picked last, not last run's stale value.
+    st.subheader("Best Performing" if st.session_state.get("most_played_sort") == "Best Performing" else "Most Played")
+with col_mp_sort:
+    st.markdown("<div style='color:var(--tft-gold);font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;text-align:right;'>Rank By</div>", unsafe_allow_html=True)
+    st.selectbox("Rank by", options=["Most Played", "Best Performing"], key="most_played_sort", label_visibility="collapsed")
 st.markdown("<hr class='tft-divider' />", unsafe_allow_html=True)
-units = most_played_units(queue_id=queue_id)
+
+_sort_by = "performance" if st.session_state["most_played_sort"] == "Best Performing" else "frequency"
+units = most_played_units(queue_id=queue_id, sort_by=_sort_by)
 _metatft_champions_ref = get_metatft_champion_lookup(_champion_data)
+
+col_units, col_traits = st.columns(2)
 
 rows_html = ""
 for i, (character_id, name, times_played, avg_place) in enumerate(units):
@@ -463,21 +942,96 @@ for i, (character_id, name, times_played, avg_place) in enumerate(units):
         + ("<div style='color:#bbb;'>" + ability_desc + "</div>" if ability_desc else "<div style='color:#666;font-style:italic;'>No ability data available.</div>")
         + "</div></div>"
     )
-    icon_html = "<div class='tft-tooltip-wrap' style='margin-right:10px;'>" + icon_html.replace("margin-right:10px;", "") + tooltip_content + "</div>"
+    icon_html = "<div class='tft-tooltip-wrap' style='margin-right:6px;'>" + icon_html.replace("margin-right:10px;", "") + tooltip_content + "</div>"
 
+    # Column widths below are deliberately tight — these rows now live in a
+    # half-width column (Units/Traits side by side), not the full page
+    # width the original single-column design had. Measured live via
+    # DevTools (canvas text measurement + scrollWidth checks) rather than
+    # guessed: the old 100px "games"/"avg" columns alone left so little
+    # room that names truncated to a single letter, and even after
+    # shrinking those, a few longer trait names (e.g. "Emerald Aspect (1)")
+    # still clipped their breakpoint number until padding/margins were
+    # trimmed too and the name got an explicit smaller font-size.
     row_bg = "rgba(255,255,255,0.02)" if i % 2 else "transparent"
     rows_html += (
-        "<div style='display:flex;align-items:center;padding:8px 12px;background:" + row_bg + ";border-radius:6px;'>"
-        "<span style='color:#666;font-size:12px;width:20px;'>" + str(i + 1) + "</span>"
+        "<div style='display:flex;align-items:center;padding:8px 8px;background:" + row_bg + ";border-radius:6px;'>"
+        "<span style='color:#666;font-size:12px;width:16px;flex:0 0 auto;'>" + str(i + 1) + "</span>"
         + icon_html +
-        "<span style='flex:1;color:#eee;font-weight:600;'>" + name + "</span>"
-        "<span style='color:#999;font-size:13px;width:100px;text-align:right;'>" + str(times_played) + " games</span>"
-        "<span style='color:" + placement_color(round(avg_place)) + ";font-size:13px;width:100px;text-align:right;font-weight:600;'>" + f"{avg_place:.2f}" + " avg</span>"
+        "<span style='flex:1;min-width:0;font-size:14px;color:#eee;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;'>" + name + "</span>"
+        "<span style='color:#999;font-size:13px;width:58px;flex:0 0 auto;text-align:right;'>" + str(times_played) + " games</span>"
+        "<span style='color:" + placement_color(round(avg_place)) + ";font-size:13px;width:56px;flex:0 0 auto;text-align:right;font-weight:600;'>" + f"{avg_place:.2f}" + " avg</span>"
         "</div>"
     )
 
-with st.container(border=True):
-    st.markdown("<div style='padding:10px 0;'>" + rows_html + "</div>", unsafe_allow_html=True)
+with col_units:
+    with st.container(border=True):
+        st.markdown("<div style='color:#999;font-size:12px;text-transform:uppercase;letter-spacing:1px;margin:2px 0 4px;'>Units</div>", unsafe_allow_html=True)
+        st.markdown("<div style='padding:10px 0;'>" + rows_html + "</div>", unsafe_allow_html=True)
+
+# Trait rows mirror the unit rows above (same layout, same per-row hover
+# tooltip pattern) so the two lists read as one consistent "Most Played"
+# component split into two columns — but each row here is a specific
+# (trait, breakpoint) pair, e.g. "Brawler (4)" ranked separately from
+# "Brawler (2)", rather than one lumped-together "Brawler" entry, so a
+# trait that plays very differently at different breakpoints doesn't hide
+# that. Icon and name are tinted with that breakpoint's tier color (bronze/
+# silver/gold/prismatic) — the same colored-badge technique already used
+# for trait icons in the match history cards, reused here for consistency.
+traits_played = most_played_traits(queue_id=queue_id, sort_by=_sort_by)
+trait_data_ref = build_trait_data()
+trait_static_ref = build_trait_static_data()
+
+trait_rows_html = ""
+for i, (trait_api_name, name, min_units, style, times_active, avg_place) in enumerate(traits_played):
+    trait_info = trait_data_ref.get(trait_api_name)
+    icon_url = tex_path_to_url(trait_info["icon"]) if trait_info and trait_info.get("icon") else None
+    color = trait_style_color(style)
+    label = name + (" (" + str(min_units) + ")" if min_units else "")
+
+    if icon_url:
+        icon_html = (
+            "<div style='position:relative;width:32px;height:32px;border-radius:50%;border:2px solid " + color + ";"
+            "overflow:hidden;display:flex;align-items:center;justify-content:center;flex:0 0 auto;margin-right:10px;'>"
+            "<img src='" + icon_url + "' style='width:20px;height:20px;filter:grayscale(100%);display:block;' />"
+            "<div style='position:absolute;inset:0;background:" + color + ";mix-blend-mode:color;'></div>"
+            "</div>"
+        )
+    else:
+        icon_html = "<div style='width:32px;height:32px;border-radius:50%;border:3px solid " + color + ";flex:0 0 auto;margin-right:10px;'></div>"
+
+    # Unlike the aggregate unit-ability tooltip, this row IS tied to one
+    # specific breakpoint, so passing that breakpoint's real min_units lets
+    # resolve_trait_breakpoints correctly mark it (and any lower ones) as
+    # reached instead of showing everything dimmed.
+    tt = resolve_trait_breakpoints(trait_static_ref.get(trait_api_name), min_units or 0)
+    tooltip_content = (
+        "<div class='tft-tooltip-content' style='border:2px solid " + color + ";'><div style='padding:8px;'>"
+        "<div style='font-weight:bold;color:#fff;margin-bottom:4px;'>" + label + "</div>"
+        + ("<div style='color:#bbb;margin-bottom:6px;'>" + tt["intro"] + "</div>" if tt.get("intro") else "")
+        + "".join("<div style='color:" + ("#fff" if bp["reached"] else "#666") + ";margin-bottom:2px;'>" + bp["text"] + "</div>" for bp in tt.get("breakpoints", []))
+        + ("" if tt.get("breakpoints") or tt.get("intro") else "<div style='color:#666;font-style:italic;'>No trait data available.</div>")
+        + "</div></div>"
+    )
+    icon_html = "<div class='tft-tooltip-wrap' style='margin-right:6px;'>" + icon_html.replace("margin-right:10px;", "") + tooltip_content + "</div>"
+
+    # Same tight-column reasoning as the units row above — measured live,
+    # not guessed (see the comment there for how these numbers were found).
+    row_bg = "rgba(255,255,255,0.02)" if i % 2 else "transparent"
+    trait_rows_html += (
+        "<div style='display:flex;align-items:center;padding:8px 8px;background:" + row_bg + ";border-radius:6px;'>"
+        "<span style='color:#666;font-size:12px;width:16px;flex:0 0 auto;'>" + str(i + 1) + "</span>"
+        + icon_html +
+        "<span style='flex:1;min-width:0;font-size:14px;color:" + color + ";font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;'>" + label + "</span>"
+        "<span style='color:#999;font-size:13px;width:58px;flex:0 0 auto;text-align:right;'>" + str(times_active) + " games</span>"
+        "<span style='color:" + placement_color(round(avg_place)) + ";font-size:13px;width:56px;flex:0 0 auto;text-align:right;font-weight:600;'>" + f"{avg_place:.2f}" + " avg</span>"
+        "</div>"
+    )
+
+with col_traits:
+    with st.container(border=True):
+        st.markdown("<div style='color:#999;font-size:12px;text-transform:uppercase;letter-spacing:1px;margin:2px 0 4px;'>Traits</div>", unsafe_allow_html=True)
+        st.markdown("<div style='padding:10px 0;'>" + trait_rows_html + "</div>", unsafe_allow_html=True)
 
 # --- Patch changes ---
 from patch_tracker import latest_diff
