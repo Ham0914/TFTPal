@@ -2,7 +2,7 @@ import sqlite3
 from game_data import build_champion_data, build_item_data
 from metatft_data import build_metatft_champion_lookup, build_metatft_item_lookup, build_metatft_item_name_lookup
 
-conn = sqlite3.connect("tft_coach.db")
+conn = sqlite3.connect("tftinsight.db")
 character_ids = {row[0] for row in conn.execute("SELECT DISTINCT character_id FROM units")}
 raw_items = conn.execute("SELECT DISTINCT items FROM units WHERE items != ''").fetchall()
 conn.close()

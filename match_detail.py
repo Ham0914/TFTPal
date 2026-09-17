@@ -505,14 +505,14 @@ def resolve_metatft_markup(
     text = re.sub(r'\s{2,}', ' ', text)
     return text.strip()
 
-def get_match_detail(match_id: str, game_name: str, tag_line: str) -> dict:
-    game_row = get_game(match_id)
+def get_match_detail(match_id: str, puuid: str, game_name: str, tag_line: str) -> dict:
+    game_row = get_game(match_id, puuid)
     (_, placement, level, gold_left, last_round, set_number,
      game_datetime, queue_id, rank_tier, rank_division, league_points, total_damage,
      companion_content_id, companion_item_id) = game_row
 
-    raw_units = get_units_for_match(match_id)
-    raw_traits = get_traits_for_match(match_id)
+    raw_units = get_units_for_match(match_id, puuid)
+    raw_traits = get_traits_for_match(match_id, puuid)
     trait_data = build_trait_data(set_number)
     champion_data = build_champion_data(set_number)
     used_character_ids = {character_id for character_id, star_level, items_string in raw_units}

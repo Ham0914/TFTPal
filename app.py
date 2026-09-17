@@ -1,7 +1,8 @@
 import random
+import time
 import streamlit as st
 from stats import average_placement, top4_rate, win_rate, placement_breakdown, most_played_units, most_played_traits, match_history
-from fetch_match import GAME_NAME, TAG_LINE, REGION, get_puuid, get_recent_match_ids, get_match_details
+from fetch_match import GAME_NAME, TAG_LINE, REGIONS, get_puuid, get_all_match_ids, get_match_details
 from rank import get_rank_for_match_queue
 from database import get_game, get_connection, save_match, create_tables
 from match_detail import placement_color
@@ -16,9 +17,9 @@ import pandas as pd
 
 
 @st.cache_data(ttl=600)
-def _cached_rating_history(game_name: str, tag_line: str, queue_id: int = 1100) -> list:
+def _cached_rating_history(game_name: str, tag_line: str, platform: str = "euw1", queue_id: int = 1100) -> list:
     try:
-        return fetch_rating_history(game_name, tag_line, queue_id=queue_id)
+        return fetch_rating_history(game_name, tag_line, region=platform, queue_id=queue_id)
     except Exception:
         return []
 
@@ -42,11 +43,88 @@ def _rating_queue_for_filter(selected_queue_id):
 def _cached_puuid(game_name: str, tag_line: str, region: str) -> str:
     # PUUID never changes for a given Riot ID, so this is safe to cache for
     # the life of the server process rather than re-hitting the Account API
-    # on every refresh-button click.
+    # on every refresh-button click. Keyed on (game_name, tag_line, region),
+    # so this naturally caches per-player correctly once search can pass in
+    # someone other than the default account.
     return get_puuid(game_name, tag_line, region)
 
 
-def refresh_player_matches() -> dict:
+# The account this app defaults to on load and falls back to via "Back to
+# my stats" — unrelated to whoever else gets searched in a given session.
+DEFAULT_PLAYER = {"game_name": GAME_NAME, "tag_line": TAG_LINE, "region_key": "EUW"}
+
+
+def _reroll_hero_backgrounds():
+    """
+    Clears the cached hero/background champion picks so the next rerun
+    rolls fresh ones — called whenever the viewed player changes (search,
+    or "Back to my stats") so the artwork feels tied to whoever you're
+    looking at instead of staying fixed to whatever was rolled on first
+    page load for the entire session.
+    """
+    st.session_state.pop("hero_champion", None)
+    st.session_state.pop("bg_champion", None)
+
+
+def _handle_player_search(name: str, tag: str, region_key: str) -> None:
+    """
+    Shared by both the Home page's hero search and the dashboard's own
+    search box — one place owning "look this Riot ID up, switch to it,
+    pull their matches, tell the user what happened" instead of two
+    copies that could drift. On success this also routes to the stats
+    page via query params — the mechanism that makes searching from Home
+    land you on the dashboard.
+    """
+    name = name.strip()
+    tag = tag.strip().lstrip("#")
+    query = f"{name}#{tag}"
+    if not name or not tag:
+        _dismissible_alert("Enter both a name and a tag to search for.", "warning")
+        return
+    try:
+        # Riot's account lookup is global (works under any cluster for any
+        # player), so this succeeding proves nothing about whether the
+        # REGION picked is right — only match/rank data is actually
+        # region-scoped. Confirmed live: querying a EUW account's matches
+        # under "americas" doesn't error, it just silently returns zero
+        # matches. The real region check has to happen after fetching, below.
+        found_puuid = get_puuid(name, tag, REGIONS[region_key]["cluster"])
+    except Exception:
+        _dismissible_alert(f"Couldn't find {query} on {region_key}.", "error")
+        return
+    st.session_state["viewed_player"] = {
+        "game_name": name, "tag_line": tag,
+        "region_key": region_key, "puuid": found_puuid,
+    }
+    _reroll_hero_backgrounds()
+    with st.spinner(f"Fetching {name}'s match history..."):
+        refresh_result = refresh_player_matches(_get_viewed_player())
+    if "error" in refresh_result:
+        _dismissible_alert(f"Found {query}, but couldn't fetch their matches: " + refresh_result["error"], "error")
+    elif refresh_result["new_matches"] == 0 and not match_history(found_puuid, queue_id=None):
+        _dismissible_alert(f"No matches found for {query} on {region_key} — wrong region? Try another.", "warning")
+    else:
+        st.query_params["page"] = "stats"
+        st.rerun()
+
+
+def _get_viewed_player() -> dict:
+    """
+    Returns the player currently being viewed (default: your own account,
+    or whoever was last searched this session), resolved to a puuid and
+    merged with that region's cluster/platform codes. Session-scoped only
+    — a page reload/new browser tab starts back at DEFAULT_PLAYER.
+    """
+    if "viewed_player" not in st.session_state:
+        st.session_state["viewed_player"] = dict(DEFAULT_PLAYER)
+    player = st.session_state["viewed_player"]
+    region = REGIONS[player["region_key"]]
+    if "puuid" not in player:
+        player["puuid"] = _cached_puuid(player["game_name"], player["tag_line"], region["cluster"])
+    return {**player, **region}
+
+
+def refresh_player_matches(player: dict) -> dict:
     """
     Manual "catch me up" action for the Refresh button: checks the most
     recent matches on Riot's side, saves any not already in the database
@@ -59,38 +137,60 @@ def refresh_player_matches() -> dict:
     """
     try:
         create_tables()
-        puuid = _cached_puuid(GAME_NAME, TAG_LINE, REGION)
+        puuid = player["puuid"]
 
         conn = get_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT match_id FROM games")
+        cursor.execute("SELECT match_id FROM games WHERE puuid = ?", (puuid,))
         saved_ids = {row[0] for row in cursor.fetchall()}
         conn.close()
 
-        # 20 is a middle ground between watcher.py's count=5 (fine for a
-        # process polling every 90s, too shallow if the app hasn't been
-        # opened in a while) and fetch_match.py's full-sync count=30 (more
-        # thorough than a manual "check for anything new" click needs).
-        recent_ids = get_recent_match_ids(puuid, REGION, count=20)
-        new_ids = [mid for mid in recent_ids if mid not in saved_ids]
+        # Paginates through this player's match-id history (a plain
+        # count=20 permanently missed everything older than that, which
+        # meant a first-time search of a player with real history computed
+        # stats from an incomplete slice of their games). Listing ids is
+        # cheap regardless of history length (~1 API call per 100 games) —
+        # the expensive part is the per-match detail fetch below, which is
+        # bounded to the current set (see the break below), not run for
+        # every id here.
+        all_ids = get_all_match_ids(puuid, player["cluster"])
+        new_ids = [mid for mid in all_ids if mid not in saved_ids]
 
+        # match-v1 returns ids newest-first, and every match carries its
+        # own real tft_set_number — so instead of guessing this set's
+        # launch date (wrong in either direction: too early wastes time
+        # re-fetching older sets nobody's asking to see, too late silently
+        # drops real games), just fetch forward until a match turns out to
+        # be from an older set, then stop. Self-correcting regardless of
+        # when the current set actually started, and works the same for a
+        # brand-new player's first full sync as for a routine top-up.
+        CURRENT_SET = 18
         rank_cache = {}
+        new_matches_saved = 0
         for match_id in new_ids:
-            match_data = get_match_details(match_id, REGION)
+            match_data = get_match_details(match_id, player["cluster"])
+            if match_data["info"]["tft_set_number"] < CURRENT_SET:
+                break
             match_queue_id = match_data["info"]["queueId"]
             if match_queue_id not in rank_cache:
                 try:
-                    rank_cache[match_queue_id] = get_rank_for_match_queue(puuid, match_queue_id)
+                    rank_cache[match_queue_id] = get_rank_for_match_queue(puuid, match_queue_id, platform=player["platform"])
                 except Exception:
                     rank_cache[match_queue_id] = None
             save_match(match_data, puuid, rank_info=rank_cache[match_queue_id])
+            new_matches_saved += 1
+            # A first-time search or a long-idle refresh can suddenly mean
+            # dozens/hundreds of new matches instead of a handful — pace
+            # requests the same way fetch_match.py's own full-sync does,
+            # so a big backlog doesn't blow through Riot's rate limits.
+            time.sleep(1.2)
 
-        return {"new_matches": len(new_ids)}
+        return {"new_matches": new_matches_saved}
     except Exception as e:
         return {"error": str(e)}
 
 
-def _dismissible_alert(text: str, kind: str = "info") -> None:
+def _dismissible_alert(text: str, kind: str = "info", align: str = "left") -> None:
     """
     Like st.info/warning/success/error, but auto-fades after ~10s (see the
     .tft-alert-fade-a/-b CSS animations) — which native st.info etc. can't
@@ -127,9 +227,19 @@ def _dismissible_alert(text: str, kind: str = "info") -> None:
     toggle = 1 - st.session_state.get("_alert_variant_toggle", 0)
     st.session_state["_alert_variant_toggle"] = toggle
     variant_class = "tft-alert-fade-a" if toggle == 0 else "tft-alert-fade-b"
+    # display:inline-block (not the default block) so the pill shrinks to
+    # fit short messages like "Up to date" instead of stretching to fill
+    # whatever column/container it happens to sit in — max-width keeps
+    # longer messages wrapping within that space rather than overflowing it.
+    # The outer div's text-align controls which side of that space the now-
+    # shrunk pill sits against (e.g. "right" to hug a button immediately to
+    # its right, like the Match History refresh button).
     st.markdown(
+        "<div style='text-align:" + align + ";'>"
         "<div class='" + variant_class + "' style='background:" + bg + ";color:" + color + ";"
-        "border-radius:8px;padding:12px 16px;font-size:14px;margin-bottom:8px;'>" + text + "</div>",
+        "border-radius:8px;padding:8px 14px;font-size:14px;margin-bottom:8px;"
+        "display:inline-block;max-width:100%;box-sizing:border-box;text-align:left;'>" + text + "</div>"
+        "</div>",
         unsafe_allow_html=True,
     )
 
@@ -232,7 +342,20 @@ st.markdown("""
            page reads consistently rather than match history alone being
            fully solid while everything else was fully transparent. */
         background: linear-gradient(180deg, rgba(20,23,31,0.7) 0%, rgba(16,19,26,0.7) 100%) !important;
-        box-shadow: 0 2px 10px rgba(0,0,0,0.35);
+        box-shadow: 0 2px 10px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.04);
+        /* --card-accent is set inline per-card (the match's placement
+           color) so hover feedback reads as "this specific match lit up",
+           not a generic one-size highlight — same idea as the border-left
+           accent each card already carries. */
+        transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+    }
+    details.tft-card:hover {
+        transform: translateY(-2px);
+        border-color: var(--card-accent, var(--tft-gold)) !important;
+        box-shadow:
+            0 10px 26px -6px color-mix(in srgb, var(--card-accent, var(--tft-gold)) 40%, transparent),
+            0 2px 12px rgba(0,0,0,0.4),
+            inset 0 1px 0 rgba(255,255,255,0.06);
     }
     /* st.container(border=True) boxes (Last N Games, the two charts, Most
        Played Units) render as a plain stVerticalBlock with Streamlit's own
@@ -252,6 +375,25 @@ st.markdown("""
     }
     details.tft-card summary { list-style: none; }
     details.tft-card summary::-webkit-details-marker { display: none; }
+    /* The summary's border-left accent stripe is drawn on its own child
+       box, which doesn't automatically pick up the outer <details>'s
+       rounded corners — left as a flat 90-degree edge, it visibly pokes
+       past the parent's curve right where hover brightens the border,
+       which is what made it read as "sharp" against everything else's
+       rounded look. 9px (not 10px) so the stripe's curve sits concentric
+       just inside the outer 1px border rather than slightly outside it.
+       Closed, the summary IS the whole visible card, so both left corners
+       round; open, the content panel below already rounds its own
+       bottom-left corner (see the left_html wrapper below), so the
+       summary's bottom-left corner squares off to butt against it instead
+       of leaving a rounded notch. */
+    /* border-radius transitions here use the exact same durations/easings
+       as the height animation on ::details-content above (0.4s
+       cubic-bezier expand, 0.32s ease-in collapse) so the corner unrounds/
+       rounds in step with the panel opening and closing, instead of
+       snapping instantly the moment [open] toggles. */
+    details.tft-card summary { border-radius: 9px 0 0 9px; transition: border-radius 0.32s ease-in; }
+    details.tft-card[open] summary { border-radius: 9px 0 0 0; transition: border-radius 0.4s cubic-bezier(0.22, 1, 0.36, 1); }
     .tft-card-chevron { transition: transform 0.15s ease; }
     details.tft-card[open] .tft-card-chevron { transform: rotate(180deg); }
 
@@ -288,12 +430,26 @@ st.markdown("""
         height: 0;
         overflow: hidden;
         opacity: 0;
-        transition: height 0.32s ease-in, opacity 0.2s ease-in, content-visibility 0.32s allow-discrete;
+        transition: height 0.32s ease-in, opacity 0.2s ease-in, overflow 0.32s allow-discrete, content-visibility 0.32s allow-discrete;
     }
+    /* overflow:visible here (not hidden) is the actual fix for unit/trait
+       tooltips getting a flat clip where they crossed this box's top edge:
+       tooltips are position:absolute descendants whose containing block
+       (.tft-tooltip-wrap) lives inside this pseudo-element, so as long as
+       it stays overflow:hidden they can never escape upward past it,
+       however far below the card top the hovered icon sits. allow-discrete
+       makes this switch to visible only once the expand transition
+       finishes (not instantly on open), same reasoning as
+       content-visibility above it — during the height 0->auto animation
+       overflow needs to stay hidden or the not-yet-"grown-into" content
+       would flash fully visible outside the still-small box. On close it
+       switches back to hidden only once the collapse transition finishes,
+       for the same reason in reverse. */
     details.tft-card[open]::details-content {
         height: auto;
+        overflow: visible;
         opacity: 1;
-        transition: height 0.4s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.25s ease-out, content-visibility 0.4s allow-discrete;
+        transition: height 0.4s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.25s ease-out, overflow 0.4s allow-discrete, content-visibility 0.4s allow-discrete;
     }
 
     /* Sidebar theme, and the game-mode selectbox that lives there */
@@ -442,6 +598,43 @@ st.markdown("""
         display: flex; align-items: center; gap: 5px;
     }
     .tft-mini-stat .value { font-size: 18px; font-weight: 700; color: #fff; margin-top: 3px; }
+
+    /* Home page hero — same elevated-card language as #tft-hero-card
+       (rounded, clipped, deep floating shadow) but without that element's
+       view-timeline machinery, which exists purely to drive the dashboard's
+       scroll-triggered compact bar. Home is a single hero screen with
+       nothing to scroll past, so none of that applies here. */
+    .tft-home-hero {
+        position: relative; min-height: 620px; border-radius: 18px; overflow: hidden;
+        box-shadow:
+            0 28px 48px -16px rgba(0,0,0,0.65),
+            0 10px 20px rgba(0,0,0,0.4),
+            inset 0 1px 0 rgba(255,255,255,0.07);
+        display: flex; align-items: center; justify-content: center;
+    }
+    /* st.container(key="home_search") emits a stable "st-key-home_search"
+       class on its wrapper div (a real Streamlit feature, not a fragile
+       emotion-cache guess like the sidebar-fill rule above) — used here to
+       scope these bigger input styles to Home's hero search only, without
+       touching the dashboard's own same-shaped search box. */
+    .st-key-home_search input[type="text"] {
+        font-size: 20px !important; padding: 14px 16px !important; height: auto !important;
+    }
+    .st-key-home_search div[data-baseweb="select"] > div {
+        font-size: 18px !important; padding-top: 6px !important; padding-bottom: 6px !important;
+    }
+    .st-key-home_search button {
+        font-size: 18px !important; padding: 14px 0 !important; height: 100% !important;
+    }
+    /* Pulls the search row (a normal Streamlit block, rendered AFTER the
+       hero card markdown — Streamlit widgets can't be nested inside raw
+       HTML from st.markdown, only placed as siblings) up so it visually
+       sits inside the hero image's lower portion instead of below the
+       card. The hero has no background of its own at this y-position
+       other than the splash image + dark gradient overlay showing through
+       from beneath, since this container paints on top in normal sibling
+       order — exact pixel value tuned live via DevTools, not guessed. */
+    .st-key-home_search_outer { margin-top: -170px; position: relative; z-index: 2; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -449,12 +642,31 @@ st.markdown("""
 # Used for the player card AND the compact scroll bar (same champion in
 # both, so the identity feels continuous as you scroll) — the full-page
 # backdrop deliberately gets an INDEPENDENT random pick (bg_champion,
-# below) so the two don't just show the same picture twice. ---
+# below) so the two don't just show the same picture twice.
+#
+# The actual mark of a high-quality asset here is the "splash_centered"
+# filename Riot ships (a polished, cropped-for-UI splash) — confirmed by
+# inspecting the raw data that this exists across EVERY cost tier
+# (1-cost through 5-cost all have it on 80-95% of their roster), not just
+# 4-5 costs. The old `cost >= 4` gate was standing in for "looks premium"
+# but was actually just discarding ~40 perfectly good splash images from
+# cheaper champions for no real quality reason — dropping it nearly
+# triples the usable pool (23 unique images before -> 55 now).
+# Deduping by the resolved icon path (not just by champion entry) matters
+# because cosmetic skin variants of the same base champion — e.g. Lux's 8
+# emblem forms — are separate entries that all point at one shared image;
+# without this a single splash would be ~8x overrepresented at random.
 _champion_data = build_champion_data()
-_splash_candidates = [
-    c for c in _champion_data.values()
-    if c.get("cost", 0) >= 4 and c.get("icon") and c["icon"] != "None" and c.get("traits")
-]
+_seen_splash_icons = set()
+_splash_candidates = []
+for _c in _champion_data.values():
+    _icon = _c.get("icon")
+    if not _c.get("traits") or not _icon or _icon == "None" or "splash_centered" not in _icon:
+        continue
+    if _icon in _seen_splash_icons:
+        continue
+    _seen_splash_icons.add(_icon)
+    _splash_candidates.append(_c)
 if "hero_champion" not in st.session_state:
     st.session_state["hero_champion"] = random.choice(_splash_candidates) if _splash_candidates else None
 _hero = st.session_state["hero_champion"]
@@ -522,6 +734,116 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# --- Site routing. st.query_params is URL-backed (not just session_state),
+# so a clicked <a href="?page=..."> nav link, a direct bookmark/refresh of
+# "?page=stats", and a Python-triggered st.query_params["page"]="stats"
+# after a successful search all funnel through the exact same mechanism —
+# no separate page variable to keep in sync with three different triggers. ---
+current_page = st.query_params.get("page", "home")
+if current_page not in ("home", "stats"):
+    current_page = "home"
+
+NAV_ITEMS = ["Home", "Player Stats", "Leaderboards", "About"]
+# Only Home/Player Stats have anywhere to go — Leaderboards/About stay
+# inert exactly as before, since no such pages exist yet.
+NAV_PAGE_LINKS = {"Home": "home", "Player Stats": "stats"}
+NAV_ACTIVE_ITEM = "Home" if current_page == "home" else "Player Stats"
+
+def _nav_html(font_size: int = 13, gap: int = 22) -> str:
+    items_html = ""
+    for item in NAV_ITEMS:
+        is_active = item == NAV_ACTIVE_ITEM
+        color = "var(--tft-gold)" if is_active else "rgba(255,255,255,0.65)"
+        weight = "700" if is_active else "500"
+        # Inactive items get a transparent border-bottom (not "none") so
+        # the hover state can swap it to gold without the text shifting —
+        # same 2px reserved either way, just invisible until hovered.
+        underline = "border-bottom:2px solid var(--tft-gold);" if is_active else "border-bottom:2px solid transparent;"
+        shared_style = (
+            "color:" + color + ";font-weight:" + weight + ";font-size:" + str(font_size) + "px;"
+            "letter-spacing:0.5px;white-space:nowrap;padding-bottom:4px;" + underline
+        )
+        target_page = NAV_PAGE_LINKS.get(item)
+        if target_page:
+            # target='_self' keeps the navigation in the same tab/frame —
+            # a plain relative href already would here, but explicit
+            # against any embedding context this app might run inside.
+            items_html += (
+                "<a href='?page=" + target_page + "' target='_self' class='tft-nav-item' "
+                "style='text-decoration:none;cursor:pointer;" + shared_style + "'>" + item + "</a>"
+            )
+        else:
+            items_html += (
+                "<span class='tft-nav-item' style='cursor:default;" + shared_style + "'>" + item + "</span>"
+            )
+    return "<div style='display:flex;gap:" + str(gap) + "px;align-items:center;'>" + items_html + "</div>"
+
+if current_page == "home":
+    _home_hero_bg = (
+        "background-image:url(" + _hero_splash + ");background-size:cover;background-position:center 20%;"
+        if _hero_splash else "background:var(--tft-bg-panel);"
+    )
+    home_hero_html = (
+        "<div class='tft-home-hero' style='" + _home_hero_bg + "'>"
+        "<div style='position:absolute;inset:0;background:linear-gradient(180deg, rgba(6,7,10,0.5) 0%, rgba(6,7,10,0.72) 55%, rgba(6,7,10,0.94) 100%);'></div>"
+        "<div style='position:absolute;top:0;left:0;right:0;padding:22px 28px;display:flex;justify-content:center;background:linear-gradient(rgba(6,7,10,0.45), transparent);'>"
+        + _nav_html() +
+        "</div>"
+        "<div style='position:relative;text-align:center;padding:0 24px;max-width:760px;'>"
+        "<div style='font-size:58px;font-weight:800;color:#fff;letter-spacing:1px;text-shadow:0 4px 18px rgba(0,0,0,0.8);'>TFTInsight</div>"
+        "<div style='font-size:15px;color:var(--tft-gold);letter-spacing:3px;text-transform:uppercase;margin-top:8px;'>Set 18 &middot; Enchanted Wilds</div>"
+        "<div style='font-size:18px;color:#ddd;margin-top:26px;line-height:1.6;'>Search any Riot ID for live match history, rank progress, and trait performance &mdash; yours or anyone else's.</div>"
+        "</div>"
+        "</div>"
+    )
+    st.markdown(home_hero_html, unsafe_allow_html=True)
+
+    home_search_outer = st.container(key="home_search_outer")
+    with home_search_outer:
+        _, home_search_center, _ = st.columns([1, 5, 1])
+    with home_search_center:
+        with st.container(key="home_search"):
+            with st.form("home_search_form", clear_on_submit=False, border=False):
+                hs_col_name, hs_col_hash, hs_col_tag, hs_col_region, hs_col_button = st.columns(
+                    [2.2, 0.25, 1.2, 2.4, 1.2], vertical_alignment="center"
+                )
+                with hs_col_name:
+                    home_name_input = st.text_input(
+                        "Riot ID name", placeholder="Name", label_visibility="collapsed", key="home_name",
+                    )
+                with hs_col_hash:
+                    # Same 8px-low offset measured here as on the dashboard's
+                    # smaller search box (app.py's other _handle_player_search
+                    # caller) despite this input being visibly bigger —
+                    # confirmed live via DevTools this gap is fixed regardless
+                    # of input font-size, so the same translateY(-8px)
+                    # correction applies unchanged.
+                    st.markdown(
+                        "<div style='display:flex;align-items:center;justify-content:center;height:50px;"
+                        "color:#888;font-size:24px;font-weight:600;transform:translateY(-8px);'>#</div>",
+                        unsafe_allow_html=True,
+                    )
+                with hs_col_tag:
+                    home_tag_input = st.text_input(
+                        "Riot ID tag", placeholder="TAG", label_visibility="collapsed", key="home_tag",
+                    )
+                with hs_col_region:
+                    home_region_key = st.selectbox(
+                        "Region", options=list(REGIONS.keys()),
+                        format_func=lambda k: REGIONS[k]["label"],
+                        label_visibility="collapsed", key="home_region",
+                    )
+                with hs_col_button:
+                    home_search_submitted = st.form_submit_button("Search", use_container_width=True)
+            if home_search_submitted:
+                _handle_player_search(home_name_input, home_tag_input, home_region_key)
+
+        if st.button("View my stats →", key="home_view_my_stats", use_container_width=True):
+            st.query_params["page"] = "stats"
+            st.rerun()
+
+    st.stop()
+
 # --- Game mode filter lives in the sidebar — kept out of the hero/player
 # card entirely, always visible, never competes for space with it. ---
 QUEUE_OPTIONS = {
@@ -543,11 +865,12 @@ selected_label = st.session_state["game_mode_select"]
 queue_id = QUEUE_OPTIONS[selected_label]
 
 # --- Hero banner + player card, merged into one component ---
-avg_placement = average_placement(queue_id=queue_id)
-top4 = top4_rate(queue_id=queue_id)
-win_pct = win_rate(queue_id=queue_id)
+player = _get_viewed_player()
+avg_placement = average_placement(player["puuid"], queue_id=queue_id)
+top4 = top4_rate(player["puuid"], queue_id=queue_id)
+win_pct = win_rate(player["puuid"], queue_id=queue_id)
 
-history_for_card = match_history(queue_id=queue_id)
+history_for_card = match_history(player["puuid"], queue_id=queue_id)
 
 RANK_COLORS = {
     "IRON": "#8c7853", "BRONZE": "#a0673c", "SILVER": "#9fa8b0", "GOLD": "#d4af37",
@@ -608,7 +931,7 @@ def _rank_html(icon_height: int) -> str:
 
 rank_tier = rank_division = league_points = None
 if history_for_card:
-    latest_game = get_game(history_for_card[0][0])
+    latest_game = get_game(history_for_card[0][0], player["puuid"])
     (_, _, _, _, _, _, _, _, rank_tier, rank_division, league_points, _,
      companion_content_id, _) = latest_game
 
@@ -639,7 +962,7 @@ def _stat_tile(value: str, label: str, value_color: str = None) -> str:
 # numeric rating scale the progression chart uses, so a plain difference
 # already correctly accounts for crossing tier boundaries.
 _rating_queue_id, _rating_queue_label = _rating_queue_for_filter(queue_id)
-recent_rating = _cached_rating_history(GAME_NAME, TAG_LINE, queue_id=_rating_queue_id)[-11:] if _rating_queue_id else []
+recent_rating = _cached_rating_history(player["game_name"], player["tag_line"], platform=player["platform"], queue_id=_rating_queue_id)[-11:] if _rating_queue_id else []
 if len(recent_rating) >= 2:
     lp_change = recent_rating[-1]["rating_numeric"] - recent_rating[0]["rating_numeric"]
     if lp_change > 0:
@@ -659,29 +982,6 @@ stats_html = (
     + _stat_tile(lp_change_value, "Last 10 Games", lp_change_color)
 )
 
-# Placeholder site nav — this page isn't the site's home page, it's the
-# "Player Stats" page of a future multi-page site, so the active item
-# reflects that. Labels are inert (no href/routing) until there's an
-# actual second page for them to go to; text only, per what was asked for.
-NAV_ITEMS = ["Home", "Player Stats", "Leaderboards", "About"]
-NAV_ACTIVE_ITEM = "Player Stats"
-
-def _nav_html(font_size: int = 13, gap: int = 22) -> str:
-    items_html = ""
-    for item in NAV_ITEMS:
-        is_active = item == NAV_ACTIVE_ITEM
-        color = "var(--tft-gold)" if is_active else "rgba(255,255,255,0.65)"
-        weight = "700" if is_active else "500"
-        # Inactive items get a transparent border-bottom (not "none") so
-        # the hover state can swap it to gold without the text shifting —
-        # same 2px reserved either way, just invisible until hovered.
-        underline = "border-bottom:2px solid var(--tft-gold);" if is_active else "border-bottom:2px solid transparent;"
-        items_html += (
-            "<span class='tft-nav-item' style='color:" + color + ";font-weight:" + weight + ";font-size:" + str(font_size) + "px;"
-            "letter-spacing:0.5px;cursor:default;white-space:nowrap;padding-bottom:4px;" + underline + "'>" + item + "</span>"
-        )
-    return "<div style='display:flex;gap:" + str(gap) + "px;align-items:center;'>" + items_html + "</div>"
-
 if _hero_splash:
     hero_bg_style = "background-image:url(" + _hero_splash + ");background-size:cover;background-position:center 20%;"
 else:
@@ -697,13 +997,13 @@ hero_card_html = (
     "</div>"
 
     "<div style='position:absolute;top:54px;left:28px;'>"
-    "<div style='font-size:30px;font-weight:800;color:#fff;letter-spacing:1px;text-shadow:0 2px 8px rgba(0,0,0,0.8);'>TFT COACH</div>"
+    "<div style='font-size:30px;font-weight:800;color:#fff;letter-spacing:1px;text-shadow:0 2px 8px rgba(0,0,0,0.8);'>TFTInsight</div>"
     "<div style='font-size:13px;color:var(--tft-gold);letter-spacing:2px;text-transform:uppercase;'>Set 18 &middot; Enchanted Wilds</div>"
     "</div>"
 
     "<div style='position:absolute;top:54px;right:28px;display:flex;align-items:center;gap:14px;'>"
     "<div style='text-align:right;'>"
-    "<div style='font-size:24px;'><b style='color:#fff;'>" + GAME_NAME + "</b><span style='color:#aaa;'>#" + TAG_LINE + "</span></div>"
+    "<div style='font-size:24px;'><b style='color:#fff;'>" + player["game_name"] + "</b><span style='color:#aaa;'>#" + player["tag_line"] + "</span></div>"
     "<div style='margin-top:6px;font-size:16px;display:flex;align-items:center;'>" + _rank_html(38) + "</div>"
     "</div>"
     + avatar_html +
@@ -732,7 +1032,7 @@ hero_compact_html = (
     # are — a middle flex child can't do that without extra wrapper markup.
     "<div style='position:relative;display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:12px 28px;'>"
     "<div>"
-    "<div style='font-size:19px;font-weight:800;color:#fff;letter-spacing:0.5px;text-shadow:0 2px 8px rgba(0,0,0,0.8);'>TFT COACH</div>"
+    "<div style='font-size:19px;font-weight:800;color:#fff;letter-spacing:0.5px;text-shadow:0 2px 8px rgba(0,0,0,0.8);'>TFTInsight</div>"
     "<div style='font-size:11px;color:var(--tft-gold);letter-spacing:1.5px;text-transform:uppercase;'>Set 18 &middot; Enchanted Wilds</div>"
     "</div>"
 
@@ -740,7 +1040,7 @@ hero_compact_html = (
 
     "<div style='display:flex;align-items:center;gap:12px;justify-self:end;'>"
     "<div style='text-align:right;'>"
-    "<div style='font-size:17px;'><b style='color:#fff;'>" + GAME_NAME + "</b><span style='color:#aaa;'>#" + TAG_LINE + "</span></div>"
+    "<div style='font-size:17px;'><b style='color:#fff;'>" + player["game_name"] + "</b><span style='color:#aaa;'>#" + player["tag_line"] + "</span></div>"
     "<div style='margin-top:2px;font-size:13px;display:flex;align-items:center;justify-content:flex-end;'>" + _rank_html(26) + "</div>"
     "</div>"
     + _avatar_html(44) +
@@ -750,30 +1050,53 @@ hero_compact_html = (
 )
 st.markdown(hero_compact_html, unsafe_allow_html=True)
 
-# --- Player search (UI only for now — searching an arbitrary player isn't
-# wired up yet, this just reserves the spot and gives real input feedback
-# instead of doing nothing) + a real, working manual refresh. ---
+# --- Player search (any Riot ID, any of the regions in REGIONS) + a real,
+# working manual refresh for whichever player is currently being viewed. ---
 col_search, col_refresh = st.columns([5, 1.3], vertical_alignment="top")
 with col_search:
     with st.form("player_search_form", clear_on_submit=False, border=False):
-        search_col_input, search_col_button = st.columns([5, 1])
-        with search_col_input:
-            search_query = st.text_input(
-                "Search for a player", placeholder="Search for a player (Riot ID, e.g. Name#TAG)",
+        search_col_name, search_col_hash, search_col_tag, search_col_region, search_col_button = st.columns(
+            [2.6, 0.25, 1.5, 1.4, 1], vertical_alignment="center"
+        )
+        with search_col_name:
+            search_name_input = st.text_input(
+                "Riot ID name", placeholder="Name", label_visibility="collapsed",
+            )
+        with search_col_hash:
+            # Greyed-out "#" sitting between the two fields — signals the
+            # hashtag is implied/prefilled rather than something to type,
+            # without needing the user to know Riot ID syntax up front.
+            st.markdown(
+                # flex-centering alone still measured 8px low (confirmed
+                # live via DevTools getBoundingClientRect: the text_input
+                # boxes center at y=466, this plain markdown div's block
+                # centered at y=474) — text_input's actual <input> sits
+                # lower within its own widget wrapper than a bare div does
+                # within its column, likely from the collapsed label still
+                # reserving a sliver of space above it. translateY corrects
+                # for that measured gap directly rather than guessing again.
+                "<div style='display:flex;align-items:center;justify-content:center;height:42px;color:#666;font-size:20px;font-weight:600;transform:translateY(-8px);'>#</div>",
+                unsafe_allow_html=True,
+            )
+        with search_col_tag:
+            search_tag_input = st.text_input(
+                "Riot ID tag", placeholder="TAG", label_visibility="collapsed",
+            )
+        with search_col_region:
+            search_region_key = st.selectbox(
+                "Region", options=list(REGIONS.keys()),
+                format_func=lambda k: REGIONS[k]["label"],
                 label_visibility="collapsed",
             )
         with search_col_button:
             search_submitted = st.form_submit_button("Search", use_container_width=True)
     if search_submitted:
-        if search_query.strip():
-            _dismissible_alert("Player search is coming soon — for now this page only tracks " + GAME_NAME + "#" + TAG_LINE + ".", "info")
-        else:
-            _dismissible_alert("Type a Riot ID to search for.", "warning")
+        _handle_player_search(search_name_input, search_tag_input, search_region_key)
 
 with col_refresh:
-    if st.button("Refresh Stats", use_container_width=True):
+    if st.button("Refresh Stats", use_container_width=True, key="refresh_stats_top"):
         with st.spinner("Checking for new matches..."):
-            result = refresh_player_matches()
+            result = refresh_player_matches(player)
         if "error" in result:
             _dismissible_alert("Couldn't refresh: " + result["error"], "error")
         elif result["new_matches"] > 0:
@@ -781,6 +1104,17 @@ with col_refresh:
             st.rerun()
         else:
             _dismissible_alert("Up to date", "info")
+
+if (player["game_name"] != DEFAULT_PLAYER["game_name"] or player["tag_line"] != DEFAULT_PLAYER["tag_line"]
+        or player["region_key"] != DEFAULT_PLAYER["region_key"]):
+    back_col_label, back_col_button = st.columns([5, 1.3], vertical_alignment="center")
+    with back_col_label:
+        st.caption(f"Viewing {player['game_name']}#{player['tag_line']} · {player['region_key']}")
+    with back_col_button:
+        if st.button("← Back to my stats", use_container_width=True, key="back_to_my_stats"):
+            st.session_state["viewed_player"] = dict(DEFAULT_PLAYER)
+            _reroll_hero_backgrounds()
+            st.rerun()
 
 # --- Placement breakdown ---
 col_heading, col_mode = st.columns([3, 1], vertical_alignment="bottom")
@@ -799,7 +1133,7 @@ GRID_PLACEMENT_COLORS = {
 }
 GRID_DEFAULT_COLOR = ("#2e323d", "#ccc")
 
-last_n_games = match_history(queue_id=queue_id)[:30]
+last_n_games = match_history(player["puuid"], queue_id=queue_id)[:30]
 grid_html = "<div style='display:flex;flex-wrap:wrap;gap:6px;margin-bottom:16px;'>"
 for match_id, placement, level, gold_left, last_round, game_datetime, _queue_id in last_n_games:
     bg, fg = GRID_PLACEMENT_COLORS.get(placement, GRID_DEFAULT_COLOR)
@@ -829,7 +1163,7 @@ def _chart_placeholder_html(text: str) -> str:
 # --- Placement bar chart + rank progression line chart, side by side ---
 col_bar, col_line = st.columns(2)
 
-breakdown = placement_breakdown(queue_id=queue_id)
+breakdown = placement_breakdown(player["puuid"], queue_id=queue_id)
 chart_df = pd.DataFrame({
     "Placement": [str(row[0]) for row in breakdown],
     "Games": [row[1] for row in breakdown],
@@ -852,7 +1186,7 @@ with col_line:
             st.markdown("<div style='color:#999;font-size:12px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;'>" + _rating_queue_label + " LP Progression &middot; This Set</div>", unsafe_allow_html=True)
         else:
             st.markdown("<div style='color:#999;font-size:12px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;'>LP Progression</div>", unsafe_allow_html=True)
-        rating_history = _cached_rating_history(GAME_NAME, TAG_LINE, queue_id=_rating_queue_id) if _rating_queue_id else []
+        rating_history = _cached_rating_history(player["game_name"], player["tag_line"], platform=player["platform"], queue_id=_rating_queue_id) if _rating_queue_id else []
         if not _rating_queue_id:
             st.markdown(_chart_placeholder_html("Normal games have no ranked ladder."), unsafe_allow_html=True)
         elif rating_history:
@@ -902,7 +1236,7 @@ with col_mp_sort:
 st.markdown("<hr class='tft-divider' />", unsafe_allow_html=True)
 
 _sort_by = "performance" if st.session_state["most_played_sort"] == "Best Performing" else "frequency"
-units = most_played_units(queue_id=queue_id, sort_by=_sort_by)
+units = most_played_units(player["puuid"], queue_id=queue_id, sort_by=_sort_by)
 _metatft_champions_ref = get_metatft_champion_lookup(_champion_data)
 
 col_units, col_traits = st.columns(2)
@@ -978,7 +1312,7 @@ with col_units:
 # that. Icon and name are tinted with that breakpoint's tier color (bronze/
 # silver/gold/prismatic) — the same colored-badge technique already used
 # for trait icons in the match history cards, reused here for consistency.
-traits_played = most_played_traits(queue_id=queue_id, sort_by=_sort_by)
+traits_played = most_played_traits(player["puuid"], queue_id=queue_id, sort_by=_sort_by)
 trait_data_ref = build_trait_data()
 trait_static_ref = build_trait_static_data()
 
@@ -1052,9 +1386,33 @@ else:
                 st.write(f"**{c['field']}**: `{c['before']}` → `{c['after']}`")
 
 # --- Match history (clickable) ---
-st.subheader("Match History")
+# The alert gets its own column between the heading and the button rather
+# than being stacked under the button inside col_mh_refresh — with
+# vertical_alignment="bottom", extra content stacked under the button made
+# that column taller than col_mh_heading, and "bottom" aligns every column
+# to the tallest one's bottom edge, which visibly pushed the button (now
+# sitting above the alert instead of at the column's bottom) upward for as
+# long as the alert stayed in the DOM. A side-by-side column never changes
+# height, so the button no longer moves at all.
+col_mh_heading, col_mh_alert, col_mh_refresh = st.columns([3.3, 2.7, 1.3], vertical_alignment="center")
+with col_mh_heading:
+    st.subheader("Match History")
+with col_mh_refresh:
+    if st.button("Refresh Stats", use_container_width=True, key="refresh_stats_bottom"):
+        with st.spinner("Checking for new matches..."):
+            result = refresh_player_matches(player)
+        if "error" in result:
+            with col_mh_alert:
+                _dismissible_alert("Couldn't refresh: " + result["error"], "error", align="right")
+        elif result["new_matches"] > 0:
+            with col_mh_alert:
+                _dismissible_alert(f"Fetched {result['new_matches']} new match(es).", "success", align="right")
+            st.rerun()
+        else:
+            with col_mh_alert:
+                _dismissible_alert("Up to date", "info", align="right")
 st.markdown("<hr class='tft-divider' />", unsafe_allow_html=True)
-history = match_history(queue_id=queue_id)
+history = match_history(player["puuid"], queue_id=queue_id)
 
 # Rendering every match's full HTML (preview + expanded content, tooltips
 # included) on every single rerun — which Streamlit does on any widget
@@ -1063,8 +1421,9 @@ history = match_history(queue_id=queue_id)
 # that's a large payload to re-send and re-parse every time, regardless of
 # which card (if any) is actually open. Paginating cuts that down sharply.
 MATCHES_PER_PAGE = 15
-if st.session_state.get("history_queue_id") != queue_id:
-    st.session_state["history_queue_id"] = queue_id
+_history_reset_key = (player["puuid"], queue_id)
+if st.session_state.get("history_queue_id") != _history_reset_key:
+    st.session_state["history_queue_id"] = _history_reset_key
     st.session_state["matches_shown"] = MATCHES_PER_PAGE
 matches_shown = st.session_state["matches_shown"]
 visible_history = history[:matches_shown]
@@ -1075,7 +1434,7 @@ COST_COLORS = {1: "#a0a0a0", 2: "#1e9e4a", 3: "#3a7bd5", 4: "#a04dcf", 5: "#e0b0
 all_cards_html = ""
 
 for match_id, placement, level, gold_left, last_round, game_datetime, match_queue_id in visible_history:
-    detail = get_match_detail(match_id, GAME_NAME, TAG_LINE)
+    detail = get_match_detail(match_id, player["puuid"], player["game_name"], player["tag_line"])
     color = detail["placement_color"]
     mode_label = QUEUE_ID_LABELS.get(match_queue_id, "TFT")
 
@@ -1251,7 +1610,7 @@ for match_id, placement, level, gold_left, last_round, game_datetime, match_queu
         "</div>"
     )
 
-    card = "<details class='tft-card' style='border: 1px solid " + color + "40; margin-bottom: 12px; padding: 0;'>"
+    card = "<details class='tft-card' style='border: 1px solid " + color + "40; margin-bottom: 14px; padding: 0; --card-accent: " + color + ";'>"
     card += "<summary style='padding: 14px 16px; cursor: pointer; font-size: 16px; color: white; border-left: 4px solid " + color + ";'>" + summary_html + "</summary>"
     card += "<div class='tft-card-content' style='border-top: 1px solid var(--tft-border); display: flex;'>"
     card += "<div style='flex: 1; min-width: 220px; background: rgba(212,175,55,0.05); border-radius: 0 0 0 10px;'>" + left_html + "</div>"

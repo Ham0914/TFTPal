@@ -12,35 +12,47 @@ def _build_queue_filter(queue_id):
     return "AND queue_id = ?", (queue_id,)
 
 
-def average_placement(set_number: int = 18, queue_id: int = 1100):
+def _build_player_filter(puuid):
+    """
+    Mirrors _build_queue_filter — scopes every query to one player's rows.
+    Required (not optional) because the games/units/traits tables can now
+    hold more than one tracked player's data; without this every query
+    would silently mix everyone's matches together.
+    """
+    return "AND puuid = ?", (puuid,)
+
+
+def average_placement(puuid: str, set_number: int = 18, queue_id: int = 1100):
     conn = get_connection()
     cursor = conn.cursor()
 
     queue_sql, queue_params = _build_queue_filter(queue_id)
+    player_sql, player_params = _build_player_filter(puuid)
     cursor.execute(
-        f"SELECT AVG(placement) FROM games WHERE set_number = ? {queue_sql}",
-        (set_number,) + queue_params
+        f"SELECT AVG(placement) FROM games WHERE set_number = ? {queue_sql} {player_sql}",
+        (set_number,) + queue_params + player_params
     )
     result = cursor.fetchone()[0]
     conn.close()
     return result
 
 
-def top4_rate(set_number: int = 18, queue_id: int = 1100):
+def top4_rate(puuid: str, set_number: int = 18, queue_id: int = 1100):
     conn = get_connection()
     cursor = conn.cursor()
 
     queue_sql, queue_params = _build_queue_filter(queue_id)
+    player_sql, player_params = _build_player_filter(puuid)
 
     cursor.execute(
-        f"SELECT COUNT(*) FROM games WHERE set_number = ? {queue_sql}",
-        (set_number,) + queue_params
+        f"SELECT COUNT(*) FROM games WHERE set_number = ? {queue_sql} {player_sql}",
+        (set_number,) + queue_params + player_params
     )
     total_games = cursor.fetchone()[0]
 
     cursor.execute(
-        f"SELECT COUNT(*) FROM games WHERE set_number = ? {queue_sql} AND placement <= 4",
-        (set_number,) + queue_params
+        f"SELECT COUNT(*) FROM games WHERE set_number = ? {queue_sql} {player_sql} AND placement <= 4",
+        (set_number,) + queue_params + player_params
     )
     top4_games = cursor.fetchone()[0]
 
@@ -51,21 +63,22 @@ def top4_rate(set_number: int = 18, queue_id: int = 1100):
     return (top4_games / total_games) * 100
 
 
-def win_rate(set_number: int = 18, queue_id: int = 1100):
+def win_rate(puuid: str, set_number: int = 18, queue_id: int = 1100):
     conn = get_connection()
     cursor = conn.cursor()
 
     queue_sql, queue_params = _build_queue_filter(queue_id)
+    player_sql, player_params = _build_player_filter(puuid)
 
     cursor.execute(
-        f"SELECT COUNT(*) FROM games WHERE set_number = ? {queue_sql}",
-        (set_number,) + queue_params
+        f"SELECT COUNT(*) FROM games WHERE set_number = ? {queue_sql} {player_sql}",
+        (set_number,) + queue_params + player_params
     )
     total_games = cursor.fetchone()[0]
 
     cursor.execute(
-        f"SELECT COUNT(*) FROM games WHERE set_number = ? {queue_sql} AND placement = 1",
-        (set_number,) + queue_params
+        f"SELECT COUNT(*) FROM games WHERE set_number = ? {queue_sql} {player_sql} AND placement = 1",
+        (set_number,) + queue_params + player_params
     )
     wins = cursor.fetchone()[0]
 
@@ -76,18 +89,19 @@ def win_rate(set_number: int = 18, queue_id: int = 1100):
     return (wins / total_games) * 100
 
 
-def placement_breakdown(set_number: int = 18, queue_id: int = 1100):
+def placement_breakdown(puuid: str, set_number: int = 18, queue_id: int = 1100):
     conn = get_connection()
     cursor = conn.cursor()
 
     queue_sql, queue_params = _build_queue_filter(queue_id)
+    player_sql, player_params = _build_player_filter(puuid)
     cursor.execute(f"""
-        SELECT placement, COUNT(*) 
-        FROM games 
-        WHERE set_number = ? {queue_sql}
-        GROUP BY placement 
+        SELECT placement, COUNT(*)
+        FROM games
+        WHERE set_number = ? {queue_sql} {player_sql}
+        GROUP BY placement
         ORDER BY placement
-    """, (set_number,) + queue_params)
+    """, (set_number,) + queue_params + player_params)
     results = dict(cursor.fetchall())
     conn.close()
 
@@ -95,7 +109,7 @@ def placement_breakdown(set_number: int = 18, queue_id: int = 1100):
     return [(placement, results.get(placement, 0)) for placement in range(1, max_placement + 1)]
 
 
-def most_played_units(limit: int = 10, set_number: int = 18, queue_id: int = 1100, sort_by: str = "frequency", min_games: int = 3):
+def most_played_units(puuid: str, limit: int = 10, set_number: int = 18, queue_id: int = 1100, sort_by: str = "frequency", min_games: int = 3):
     """
     sort_by="frequency" (default) ranks by times played, no games floor —
     unchanged from before. sort_by="performance" ranks by best avg
@@ -108,6 +122,12 @@ def most_played_units(limit: int = 10, set_number: int = 18, queue_id: int = 110
     cursor = conn.cursor()
 
     queue_sql, queue_params = _build_queue_filter(queue_id)
+    # Filtering on units.puuid alone is enough to scope this to one
+    # player — save_match always writes the same puuid across games/
+    # units/traits for a given row, so it's never out of sync with the
+    # games join below.
+    player_sql, player_params = _build_player_filter(puuid)
+    player_sql = player_sql.replace("puuid", "units.puuid")
     if sort_by == "performance":
         order_sql = "avg_placement ASC"
         having_sql = "HAVING COUNT(*) >= ?"
@@ -121,12 +141,12 @@ def most_played_units(limit: int = 10, set_number: int = 18, queue_id: int = 110
         SELECT units.character_id, COUNT(*) as times_played, AVG(games.placement) as avg_placement
         FROM units
         JOIN games ON units.match_id = games.match_id
-        WHERE games.set_number = ? {queue_sql}
+        WHERE games.set_number = ? {queue_sql} {player_sql}
         GROUP BY units.character_id
         {having_sql}
         ORDER BY {order_sql}
         LIMIT ?
-    """, (set_number,) + queue_params + having_params + (limit,))
+    """, (set_number,) + queue_params + player_params + having_params + (limit,))
     results = cursor.fetchall()
     conn.close()
 
@@ -139,7 +159,7 @@ def most_played_units(limit: int = 10, set_number: int = 18, queue_id: int = 110
     return readable_results
 
 
-def most_played_traits(limit: int = 10, set_number: int = 18, queue_id: int = 1100, sort_by: str = "frequency", min_games: int = 3):
+def most_played_traits(puuid: str, limit: int = 10, set_number: int = 18, queue_id: int = 1100, sort_by: str = "frequency", min_games: int = 3):
     """
     Mirrors most_played_units, but for traits, broken out by which specific
     breakpoint tier was reached each game — not just "was this trait active
@@ -162,6 +182,8 @@ def most_played_traits(limit: int = 10, set_number: int = 18, queue_id: int = 11
     cursor = conn.cursor()
 
     queue_sql, queue_params = _build_queue_filter(queue_id)
+    player_sql, player_params = _build_player_filter(puuid)
+    player_sql = player_sql.replace("puuid", "traits.puuid")
     if sort_by == "performance":
         order_sql = "avg_placement ASC"
         having_sql = "HAVING COUNT(*) >= ?"
@@ -176,13 +198,13 @@ def most_played_traits(limit: int = 10, set_number: int = 18, queue_id: int = 11
                COUNT(*) as times_active, AVG(games.placement) as avg_placement
         FROM traits
         JOIN games ON traits.match_id = games.match_id
-        WHERE games.set_number = ? {queue_sql} AND traits.style != 0 AND traits.tier_current > 0
+        WHERE games.set_number = ? {queue_sql} {player_sql} AND traits.style != 0 AND traits.tier_current > 0
               AND traits.tier_total > 1
         GROUP BY traits.trait_name, traits.tier_current, traits.style
         {having_sql}
         ORDER BY {order_sql}
         LIMIT ?
-    """, (set_number,) + queue_params + having_params + (limit,))
+    """, (set_number,) + queue_params + player_params + having_params + (limit,))
     results = cursor.fetchall()
     conn.close()
 
@@ -207,7 +229,7 @@ def most_played_traits(limit: int = 10, set_number: int = 18, queue_id: int = 11
     return readable_results
 
 
-def match_history(set_number: int = 18, queue_id: int = 1100):
+def match_history(puuid: str, set_number: int = 18, queue_id: int = 1100):
     """
     Returns a list of all saved games, most recent first, as raw tuples.
     Date formatting now happens in match_detail.py instead.
@@ -216,27 +238,30 @@ def match_history(set_number: int = 18, queue_id: int = 1100):
     cursor = conn.cursor()
 
     queue_sql, queue_params = _build_queue_filter(queue_id)
+    player_sql, player_params = _build_player_filter(puuid)
     cursor.execute(f"""
         SELECT match_id, placement, level, gold_left, last_round, game_datetime, queue_id
         FROM games
-        WHERE set_number = ? {queue_sql}
+        WHERE set_number = ? {queue_sql} {player_sql}
         ORDER BY game_datetime DESC
-    """, (set_number,) + queue_params)
+    """, (set_number,) + queue_params + player_params)
     results = cursor.fetchall()
     conn.close()
 
     return results
 
 if __name__ == "__main__":
-    print(f"Average placement: {average_placement():.2f}")
-    print(f"Top 4 rate: {top4_rate():.1f}%")
+    from fetch_match import GAME_NAME, TAG_LINE, REGION, get_puuid
+
+    my_puuid = get_puuid(GAME_NAME, TAG_LINE, REGION)
+
+    print(f"Average placement: {average_placement(my_puuid):.2f}")
+    print(f"Top 4 rate: {top4_rate(my_puuid):.1f}%")
 
     print("\nPlacement breakdown:")
-    for placement, count in placement_breakdown():
+    for placement, count in placement_breakdown(my_puuid):
         print(f"  {placement}: {count} game(s)")
 
     print("\nMost played units:")
-    for character_id, name, times_played, avg_placement in most_played_units():
+    for character_id, name, times_played, avg_placement in most_played_units(my_puuid):
         print(f"  {name}: played {times_played}x, avg placement {avg_placement:.2f}")
-
-

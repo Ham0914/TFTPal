@@ -1,7 +1,7 @@
 import sqlite3
 import math
 
-DB_FILE = "tft_coach.db"
+DB_FILE = "tftinsight.db"
 
 
 def get_connection():
@@ -20,9 +20,16 @@ def create_tables():
     conn = get_connection()
     cursor = conn.cursor()
 
+    # puuid + a composite (match_id, puuid) key on games — not just
+    # match_id — because two different tracked players can genuinely be in
+    # the same lobby (same match_id) at once. A lone match_id key would
+    # mean the second player's row gets silently dropped by INSERT OR
+    # IGNORE below. New DBs get this shape from the start; an existing DB
+    # created before multi-player support needs migrate_add_puuid.py run
+    # once to add the column and rebuild games with the new key.
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS games (
-            match_id TEXT PRIMARY KEY,
+            match_id TEXT,
             placement INTEGER,
             level INTEGER,
             gold_left INTEGER,
@@ -35,7 +42,9 @@ def create_tables():
             league_points INTEGER,
             total_damage INTEGER,
             companion_content_id TEXT,
-            companion_item_id INTEGER
+            companion_item_id INTEGER,
+            puuid TEXT,
+            PRIMARY KEY (match_id, puuid)
         )
     """)
 
@@ -46,6 +55,7 @@ def create_tables():
             character_id TEXT,
             star_level INTEGER,
             items TEXT,
+            puuid TEXT,
             FOREIGN KEY (match_id) REFERENCES games (match_id)
         )
     """)
@@ -59,6 +69,7 @@ def create_tables():
             style INTEGER,
             tier_current INTEGER,
             tier_total INTEGER,
+            puuid TEXT,
             FOREIGN KEY (match_id) REFERENCES games (match_id)
         )
     """)
@@ -102,8 +113,8 @@ def save_match(match_data: dict, my_puuid: str, rank_info: dict = None):
     cursor.execute("""
         INSERT OR IGNORE INTO games
         (match_id, placement, level, gold_left, last_round, set_number, game_datetime, queue_id,
-         rank_tier, rank_division, league_points, total_damage, companion_content_id, companion_item_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         rank_tier, rank_division, league_points, total_damage, companion_content_id, companion_item_id, puuid)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         match_id,
         placement,
@@ -119,14 +130,15 @@ def save_match(match_data: dict, my_puuid: str, rank_info: dict = None):
         participant["total_damage_to_players"],
         companion.get("content_ID"),
         companion.get("item_ID"),
+        my_puuid,
     ))
 
     if cursor.rowcount == 0:
         if rank_info is not None:
             cursor.execute("""
                 UPDATE games SET rank_tier = ?, rank_division = ?, league_points = ?
-                WHERE match_id = ? AND rank_tier IS NULL
-            """, (rank_tier, rank_division, league_points, match_id))
+                WHERE match_id = ? AND puuid = ? AND rank_tier IS NULL
+            """, (rank_tier, rank_division, league_points, match_id, my_puuid))
             if cursor.rowcount > 0:
                 conn.commit()
                 print(f"Match {match_id} already in database — backfilled rank ({rank_tier} {rank_division}, {league_points} LP).")
@@ -140,19 +152,20 @@ def save_match(match_data: dict, my_puuid: str, rank_info: dict = None):
     for unit in participant["units"]:
         items_string = ", ".join(unit["itemNames"])
         cursor.execute("""
-            INSERT INTO units (match_id, character_id, star_level, items)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO units (match_id, character_id, star_level, items, puuid)
+            VALUES (?, ?, ?, ?, ?)
         """, (
             match_id,
             unit["character_id"],
             unit["tier"],
             items_string,
+            my_puuid,
         ))
 
     for trait in participant["traits"]:
         cursor.execute("""
-            INSERT INTO traits (match_id, trait_name, num_units, style, tier_current, tier_total)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO traits (match_id, trait_name, num_units, style, tier_current, tier_total, puuid)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (
             match_id,
             trait["name"],
@@ -160,45 +173,49 @@ def save_match(match_data: dict, my_puuid: str, rank_info: dict = None):
             trait["style"],
             trait["tier_current"],
             trait["tier_total"],
-        ))    
+            my_puuid,
+        ))
 
     conn.commit()
     conn.close()
 
-def get_units_for_match(match_id: str) -> list:
+def get_units_for_match(match_id: str, puuid: str) -> list:
     """
-    Returns every unit row for one specific match.
+    Returns every unit row for one specific match, for one specific
+    player — needed because two tracked players can share a match_id
+    (same lobby), and without the puuid filter this would return the
+    union of both players' boards with no way to tell them apart.
     """
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT character_id, star_level, items FROM units WHERE match_id = ?",
-        (match_id,)
+        "SELECT character_id, star_level, items FROM units WHERE match_id = ? AND puuid = ?",
+        (match_id, puuid)
     )
     results = cursor.fetchall()
     conn.close()
     return results
 
-def get_traits_for_match(match_id: str) -> list:
+def get_traits_for_match(match_id: str, puuid: str) -> list:
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT trait_name, num_units, style, tier_current, tier_total FROM traits WHERE match_id = ?",
-        (match_id,)
+        "SELECT trait_name, num_units, style, tier_current, tier_total FROM traits WHERE match_id = ? AND puuid = ?",
+        (match_id, puuid)
     )
     results = cursor.fetchall()
     conn.close()
     return results
 
-def get_game(match_id: str):
+def get_game(match_id: str, puuid: str):
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
         SELECT match_id, placement, level, gold_left, last_round, set_number,
                game_datetime, queue_id, rank_tier, rank_division, league_points, total_damage,
                companion_content_id, companion_item_id
-        FROM games WHERE match_id = ?
-    """, (match_id,))
+        FROM games WHERE match_id = ? AND puuid = ?
+    """, (match_id, puuid))
     row = cursor.fetchone()
     conn.close()
     return row
