@@ -1,7 +1,7 @@
 import sqlite3
 import math
 
-DB_FILE = "tftinsight.db"
+DB_FILE = "tftpal.db"
 
 
 def get_connection():

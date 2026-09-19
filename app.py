@@ -790,7 +790,7 @@ if current_page == "home":
         + _nav_html() +
         "</div>"
         "<div style='position:relative;text-align:center;padding:0 24px;max-width:760px;'>"
-        "<div style='font-size:58px;font-weight:800;color:#fff;letter-spacing:1px;text-shadow:0 4px 18px rgba(0,0,0,0.8);'>TFTInsight</div>"
+        "<div style='font-size:58px;font-weight:800;color:#fff;letter-spacing:1px;text-shadow:0 4px 18px rgba(0,0,0,0.8);'>TFTPal</div>"
         "<div style='font-size:15px;color:var(--tft-gold);letter-spacing:3px;text-transform:uppercase;margin-top:8px;'>Set 18 &middot; Enchanted Wilds</div>"
         "<div style='font-size:18px;color:#ddd;margin-top:26px;line-height:1.6;'>Search any Riot ID for live match history, rank progress, and trait performance &mdash; yours or anyone else's.</div>"
         "</div>"
@@ -997,7 +997,7 @@ hero_card_html = (
     "</div>"
 
     "<div style='position:absolute;top:54px;left:28px;'>"
-    "<div style='font-size:30px;font-weight:800;color:#fff;letter-spacing:1px;text-shadow:0 2px 8px rgba(0,0,0,0.8);'>TFTInsight</div>"
+    "<div style='font-size:30px;font-weight:800;color:#fff;letter-spacing:1px;text-shadow:0 2px 8px rgba(0,0,0,0.8);'>TFTPal</div>"
     "<div style='font-size:13px;color:var(--tft-gold);letter-spacing:2px;text-transform:uppercase;'>Set 18 &middot; Enchanted Wilds</div>"
     "</div>"
 
@@ -1032,7 +1032,7 @@ hero_compact_html = (
     # are — a middle flex child can't do that without extra wrapper markup.
     "<div style='position:relative;display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:12px 28px;'>"
     "<div>"
-    "<div style='font-size:19px;font-weight:800;color:#fff;letter-spacing:0.5px;text-shadow:0 2px 8px rgba(0,0,0,0.8);'>TFTInsight</div>"
+    "<div style='font-size:19px;font-weight:800;color:#fff;letter-spacing:0.5px;text-shadow:0 2px 8px rgba(0,0,0,0.8);'>TFTPal</div>"
     "<div style='font-size:11px;color:var(--tft-gold);letter-spacing:1.5px;text-transform:uppercase;'>Set 18 &middot; Enchanted Wilds</div>"
     "</div>"
 
