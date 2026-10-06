@@ -14,6 +14,10 @@ from game_data import build_trait_data, build_trait_static_data
 from metatft_rating import fetch_rating_history, short_rank_label
 import altair as alt
 import pandas as pd
+import streamlit.components.v1 as components
+from team_builder import build_team_builder_html
+
+st.set_page_config(layout="wide")
 
 
 @st.cache_data(ttl=600)
@@ -97,8 +101,11 @@ def _handle_player_search(name: str, tag: str, region_key: str) -> None:
         "region_key": region_key, "puuid": found_puuid,
     }
     _reroll_hero_backgrounds()
-    with st.spinner(f"Fetching {name}'s match history..."):
-        refresh_result = refresh_player_matches(_get_viewed_player())
+    with st.status(f"Fetching {name}'s match history...", expanded=True) as status:
+        def _report_progress(saved_count):
+            status.update(label=f"Fetching {name}'s match history — {saved_count} match(es) saved so far...")
+        refresh_result = refresh_player_matches(_get_viewed_player(), on_progress=_report_progress)
+        status.update(label="Match history fetched.", state="complete")
     if "error" in refresh_result:
         _dismissible_alert(f"Found {query}, but couldn't fetch their matches: " + refresh_result["error"], "error")
     elif refresh_result["new_matches"] == 0 and not match_history(found_puuid, queue_id=None):
@@ -110,13 +117,35 @@ def _handle_player_search(name: str, tag: str, region_key: str) -> None:
 
 def _get_viewed_player() -> dict:
     """
-    Returns the player currently being viewed (default: your own account,
-    or whoever was last searched this session), resolved to a puuid and
-    merged with that region's cluster/platform codes. Session-scoped only
-    — a page reload/new browser tab starts back at DEFAULT_PLAYER.
+    Returns the player currently being viewed, resolved to a puuid and
+    merged with that region's cluster/platform codes. On the very first
+    call in a session, seeds from the URL's name/tag/region query params
+    if present (shareable-link support — see the matching write side in
+    the dashboard body, right after this is first called there) before
+    falling back to DEFAULT_PLAYER (your own account).
     """
     if "viewed_player" not in st.session_state:
-        st.session_state["viewed_player"] = dict(DEFAULT_PLAYER)
+        qp_name = st.query_params.get("name")
+        qp_tag = st.query_params.get("tag")
+        qp_region = st.query_params.get("region")
+        if qp_name and qp_tag and qp_region in REGIONS:
+            try:
+                # Resolved eagerly (not lazily below) so a stale or
+                # mistyped shared link — a real risk here in a way it
+                # isn't for search, since _handle_player_search already
+                # validates a puuid before ever storing one — degrades to
+                # your own stats instead of crashing the whole page the
+                # first time anything downstream needs this puuid.
+                candidate_puuid = _cached_puuid(qp_name, qp_tag, REGIONS[qp_region]["cluster"])
+            except Exception:
+                st.session_state["viewed_player"] = dict(DEFAULT_PLAYER)
+                _dismissible_alert(f"Couldn't load {qp_name}#{qp_tag} from that link — showing your own stats instead.", "warning")
+            else:
+                st.session_state["viewed_player"] = {
+                    "game_name": qp_name, "tag_line": qp_tag, "region_key": qp_region, "puuid": candidate_puuid,
+                }
+        else:
+            st.session_state["viewed_player"] = dict(DEFAULT_PLAYER)
     player = st.session_state["viewed_player"]
     region = REGIONS[player["region_key"]]
     if "puuid" not in player:
@@ -124,7 +153,7 @@ def _get_viewed_player() -> dict:
     return {**player, **region}
 
 
-def refresh_player_matches(player: dict) -> dict:
+def refresh_player_matches(player: dict, on_progress=None) -> dict:
     """
     Manual "catch me up" action for the Refresh button: checks the most
     recent matches on Riot's side, saves any not already in the database
@@ -134,6 +163,16 @@ def refresh_player_matches(player: dict) -> dict:
     {"error": str} if something failed (e.g. an expired Riot API key) —
     deliberately caught here rather than left to crash the whole page,
     since this runs from a button click, not app startup.
+
+    A first-time search can mean dozens of new matches, each paced at
+    1.2s to respect Riot's rate limit (see below) — 45-60s isn't unusual,
+    and that's a floor set by Riot's own key limits, not something this
+    function can shortcut. `on_progress(saved_count)`, if given, is called
+    after each match is saved so the caller can show real movement during
+    that wait instead of a silent spinner — not a percentage, since the
+    true total isn't known until the current-set boundary is actually hit
+    (see below), and showing a fake/stuck-looking percentage would read
+    as more broken than no progress bar at all.
     """
     try:
         create_tables()
@@ -179,6 +218,8 @@ def refresh_player_matches(player: dict) -> dict:
                     rank_cache[match_queue_id] = None
             save_match(match_data, puuid, rank_info=rank_cache[match_queue_id])
             new_matches_saved += 1
+            if on_progress is not None:
+                on_progress(new_matches_saved)
             # A first-time search or a long-idle refresh can suddenly mean
             # dozens/hundreds of new matches instead of a handful — pace
             # requests the same way fetch_match.py's own full-sync does,
@@ -241,6 +282,22 @@ def _dismissible_alert(text: str, kind: str = "info", align: str = "left") -> No
         "display:inline-block;max-width:100%;box-sizing:border-box;text-align:left;'>" + text + "</div>"
         "</div>",
         unsafe_allow_html=True,
+    )
+
+
+def _riot_disclaimer_html() -> str:
+    """
+    The standard "not affiliated with Riot" disclaimer every third-party
+    TFT/LoL site carries (Mobalytics, TFTactics.gg, etc. all have one) —
+    added as a habit now rather than a launch-day scramble later. Shown
+    on both Home and the dashboard, styled as quiet footer text.
+    """
+    return (
+        "<div style='text-align:center;padding:28px 16px 12px;color:#666;font-size:11.5px;line-height:1.6;'>"
+        "TFTPal isn't endorsed by Riot Games and doesn't reflect the views or opinions of Riot Games "
+        "or anyone officially involved in producing or managing Riot Games properties. Riot Games and all "
+        "associated properties are trademarks or registered trademarks of Riot Games, Inc."
+        "</div>"
     )
 
 # --- Icons (hand-drawn inline SVGs — no dedicated Riot/tactics.tools asset
@@ -740,14 +797,14 @@ st.markdown(
 # after a successful search all funnel through the exact same mechanism —
 # no separate page variable to keep in sync with three different triggers. ---
 current_page = st.query_params.get("page", "home")
-if current_page not in ("home", "stats"):
+if current_page not in ("home", "stats", "builder"):
     current_page = "home"
 
-NAV_ITEMS = ["Home", "Player Stats", "Leaderboards", "About"]
-# Only Home/Player Stats have anywhere to go — Leaderboards/About stay
-# inert exactly as before, since no such pages exist yet.
-NAV_PAGE_LINKS = {"Home": "home", "Player Stats": "stats"}
-NAV_ACTIVE_ITEM = "Home" if current_page == "home" else "Player Stats"
+NAV_ITEMS = ["Home", "Player Stats", "Team Builder", "Leaderboards", "About"]
+# Only Home/Player Stats/Team Builder have anywhere to go — Leaderboards/About
+# stay inert exactly as before, since no such pages exist yet.
+NAV_PAGE_LINKS = {"Home": "home", "Player Stats": "stats", "Team Builder": "builder"}
+NAV_ACTIVE_ITEM = {"home": "Home", "stats": "Player Stats", "builder": "Team Builder"}[current_page]
 
 def _nav_html(font_size: int = 13, gap: int = 22) -> str:
     items_html = ""
@@ -842,6 +899,18 @@ if current_page == "home":
             st.query_params["page"] = "stats"
             st.rerun()
 
+    st.markdown(_riot_disclaimer_html(), unsafe_allow_html=True)
+    st.stop()
+
+if current_page == "builder":
+    st.markdown(
+        "<div style='display:flex;align-items:center;justify-content:center;padding:14px 28px;margin-bottom:12px;"
+        "background:var(--tft-bg-panel);border:1px solid var(--tft-border);border-radius:12px;'>"
+        + _nav_html(font_size=12, gap=18) +
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    components.html(build_team_builder_html(18), height=780, scrolling=False)
     st.stop()
 
 # --- Game mode filter lives in the sidebar — kept out of the hero/player
@@ -866,6 +935,17 @@ queue_id = QUEUE_OPTIONS[selected_label]
 
 # --- Hero banner + player card, merged into one component ---
 player = _get_viewed_player()
+# Keeps the address bar in sync with whoever's actually being viewed —
+# including your own default account, so every visit to this page has a
+# complete, bookmarkable/shareable URL, not just ones reached via search.
+# Query params (not a path like /player/EUW/Name-Tag) because Streamlit
+# is a single-endpoint app with no native path routing; this is the
+# practical equivalent within that constraint. A reverse proxy in front
+# of a real deployment could still rewrite a pretty path down to this
+# query string later, if this ever moves off localhost.
+st.query_params["region"] = player["region_key"]
+st.query_params["name"] = player["game_name"]
+st.query_params["tag"] = player["tag_line"]
 avg_placement = average_placement(player["puuid"], queue_id=queue_id)
 top4 = top4_rate(player["puuid"], queue_id=queue_id)
 win_pct = win_rate(player["puuid"], queue_id=queue_id)
@@ -1095,8 +1175,11 @@ with col_search:
 
 with col_refresh:
     if st.button("Refresh Stats", use_container_width=True, key="refresh_stats_top"):
-        with st.spinner("Checking for new matches..."):
-            result = refresh_player_matches(player)
+        with st.status("Checking for new matches...", expanded=True) as status:
+            def _report_progress(saved_count):
+                status.update(label=f"Checking for new matches — {saved_count} saved so far...")
+            result = refresh_player_matches(player, on_progress=_report_progress)
+            status.update(label="Done checking for new matches.", state="complete")
         if "error" in result:
             _dismissible_alert("Couldn't refresh: " + result["error"], "error")
         elif result["new_matches"] > 0:
@@ -1133,13 +1216,15 @@ GRID_PLACEMENT_COLORS = {
 }
 GRID_DEFAULT_COLOR = ("#2e323d", "#ccc")
 
-last_n_games = match_history(player["puuid"], queue_id=queue_id)[:30]
-grid_html = "<div style='display:flex;flex-wrap:wrap;gap:6px;margin-bottom:16px;'>"
+LAST_GRID_GAMES = 20
+last_n_games = match_history(player["puuid"], queue_id=queue_id)[:LAST_GRID_GAMES]
+# 20 equal columns so the squares span the full panel width at any window size
+grid_html = "<div style='display:grid;grid-template-columns:repeat(" + str(LAST_GRID_GAMES) + ",minmax(0,1fr));gap:8px;margin-bottom:16px;'>"
 for match_id, placement, level, gold_left, last_round, game_datetime, _queue_id in last_n_games:
     bg, fg = GRID_PLACEMENT_COLORS.get(placement, GRID_DEFAULT_COLOR)
     grid_html += (
-        "<div style='width:38px;height:38px;border-radius:6px;background:" + bg + ";color:" + fg + ";"
-        "display:flex;align-items:center;justify-content:center;font-weight:800;font-size:15px;flex:0 0 auto;'>"
+        "<div style='height:64px;border-radius:8px;background:" + bg + ";color:" + fg + ";"
+        "display:flex;align-items:center;justify-content:center;font-weight:800;font-size:22px;'>"
         + str(placement) + "</div>"
     )
 grid_html += "</div>"
@@ -1399,8 +1484,11 @@ with col_mh_heading:
     st.subheader("Match History")
 with col_mh_refresh:
     if st.button("Refresh Stats", use_container_width=True, key="refresh_stats_bottom"):
-        with st.spinner("Checking for new matches..."):
-            result = refresh_player_matches(player)
+        with st.status("Checking for new matches...", expanded=True) as status:
+            def _report_progress(saved_count):
+                status.update(label=f"Checking for new matches — {saved_count} saved so far...")
+            result = refresh_player_matches(player, on_progress=_report_progress)
+            status.update(label="Done checking for new matches.", state="complete")
         if "error" in result:
             with col_mh_alert:
                 _dismissible_alert("Couldn't refresh: " + result["error"], "error", align="right")
@@ -1420,7 +1508,7 @@ history = match_history(player["puuid"], queue_id=queue_id)
 # of the lag: with ~30 matches each carrying several KB of tooltip markup,
 # that's a large payload to re-send and re-parse every time, regardless of
 # which card (if any) is actually open. Paginating cuts that down sharply.
-MATCHES_PER_PAGE = 15
+MATCHES_PER_PAGE = 20
 _history_reset_key = (player["puuid"], queue_id)
 if st.session_state.get("history_queue_id") != _history_reset_key:
     st.session_state["history_queue_id"] = _history_reset_key
@@ -1465,10 +1553,10 @@ for match_id, placement, level, gold_left, last_round, game_datetime, match_queu
     for trait in detail["traits"]:
         if trait["icon_url"]:
             trait_img = "<div style='position:relative;width:32px;height:32px;border:2px solid " + trait['color'] + ";border-radius:50%;overflow:hidden;display:flex;align-items:center;justify-content:center;'><img src='" + trait['icon_url'] + "' style='width:20px;height:20px;filter:grayscale(100%);display:block;' /><div style='position:absolute;inset:0;background:" + trait['color'] + ";mix-blend-mode:color;'></div></div>"
-            trait_img_small = "<div style='position:relative;width:22px;height:22px;border:1.5px solid " + trait['color'] + ";border-radius:50%;overflow:hidden;display:flex;align-items:center;justify-content:center;flex:0 0 auto;'><img src='" + trait['icon_url'] + "' style='width:13px;height:13px;filter:grayscale(100%);display:block;' /><div style='position:absolute;inset:0;background:" + trait['color'] + ";mix-blend-mode:color;'></div></div>"
+            trait_img_small = "<div style='position:relative;width:30px;height:30px;border:2px solid " + trait['color'] + ";border-radius:50%;overflow:hidden;display:flex;align-items:center;justify-content:center;flex:0 0 auto;'><img src='" + trait['icon_url'] + "' style='width:18px;height:18px;filter:grayscale(100%);display:block;' /><div style='position:absolute;inset:0;background:" + trait['color'] + ";mix-blend-mode:color;'></div></div>"
         else:
             trait_img = "<div style='width:32px;height:32px;border:4px solid " + trait['color'] + ";border-radius:50%;'></div>"
-            trait_img_small = "<div style='width:22px;height:22px;border:3px solid " + trait['color'] + ";border-radius:50%;flex:0 0 auto;'></div>"
+            trait_img_small = "<div style='width:30px;height:30px;border:3px solid " + trait['color'] + ";border-radius:50%;flex:0 0 auto;'></div>"
 
         tt = trait.get("tooltip", {})
         tooltip_body = "<div style='padding:8px;'>"
@@ -1509,10 +1597,10 @@ for match_id, placement, level, gold_left, last_round, game_datetime, match_queu
 
         if unit["portrait_url"]:
             portrait_img = "<img src='" + unit['portrait_url'] + "' style='width:64px;height:64px;border:2px solid " + cost_color + ";border-radius:6px;' />"
-            portrait_img_small = "<img src='" + unit['portrait_url'] + "' style='width:36px;height:36px;border:1.5px solid " + cost_color + ";border-radius:5px;' />"
+            portrait_img_small = "<img src='" + unit['portrait_url'] + "' style='width:52px;height:52px;object-fit:cover;border:2px solid " + cost_color + ";border-radius:6px;' />"
         else:
             portrait_img = "<div style='width:64px;height:64px;background:var(--tft-bg-raised);border-radius:6px;'></div>"
-            portrait_img_small = "<div style='width:36px;height:36px;background:var(--tft-bg-raised);border:1.5px solid " + cost_color + ";border-radius:5px;'></div>"
+            portrait_img_small = "<div style='width:52px;height:52px;background:var(--tft-bg-raised);border:2px solid " + cost_color + ";border-radius:6px;'></div>"
 
         if unit["splash_url"]:
             header = "<div style='position:relative;height:130px;background-image:url(" + unit["splash_url"] + ");background-size:cover;background-position:center;display:flex;flex-direction:column;justify-content:flex-end;'>"
@@ -1626,3 +1714,5 @@ if matches_shown < len(history):
     if st.button(f"Show {min(MATCHES_PER_PAGE, remaining)} more matches ({remaining} remaining)"):
         st.session_state["matches_shown"] += MATCHES_PER_PAGE
         st.rerun()
+
+st.markdown(_riot_disclaimer_html(), unsafe_allow_html=True)

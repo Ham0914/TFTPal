@@ -2,3 +2,6 @@ venv/
 .env
 __pycache__/
 *.bak
+# Mirrored CommunityDragon images (large; regenerate with sync_assets.py)
+static/cdragon/
+static/cdragon_failed.txt
