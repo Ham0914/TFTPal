@@ -1,6 +1,16 @@
+import json
+import os
 import random
 import time
 import streamlit as st
+
+# Hosted deployments keep the Riot key in Streamlit secrets; locally it comes
+# from .env. Must run before fetch_match/rank read it at import time.
+try:
+    os.environ.setdefault("RIOT_API_KEY", st.secrets["RIOT_API_KEY"])
+except (FileNotFoundError, KeyError):
+    pass
+
 from stats import average_placement, top4_rate, win_rate, placement_breakdown, most_played_units, most_played_traits, match_history
 from fetch_match import GAME_NAME, TAG_LINE, REGIONS, get_puuid, get_all_match_ids, get_match_details
 from rank import get_rank_for_match_queue
@@ -9,7 +19,7 @@ from match_detail import placement_color
 from match_detail import get_match_detail, time_ago, ordinal
 from match_detail import get_metatft_champion_lookup, resolve_metatft_markup, clean_game_text
 from match_detail import resolve_trait_breakpoints, trait_style_color, corrected_trait_style
-from game_data import build_champion_data, tex_path_to_url, build_companion_lookup, companion_icon_url
+from game_data import build_champion_data, tex_path_to_url, build_companion_lookup, companion_icon_url, mirrored_url
 from game_data import build_trait_data, build_trait_static_data
 from metatft_rating import fetch_rating_history, short_rank_label
 import altair as alt
@@ -43,6 +53,17 @@ def _rating_queue_for_filter(selected_queue_id):
     return 1100, "Ranked"
 
 
+PUUID_CACHE_FILE = "puuid_cache.json"
+
+
+def _load_puuid_cache() -> dict:
+    try:
+        with open(PUUID_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
 @st.cache_resource
 def _cached_puuid(game_name: str, tag_line: str, region: str) -> str:
     # PUUID never changes for a given Riot ID, so this is safe to cache for
@@ -50,7 +71,22 @@ def _cached_puuid(game_name: str, tag_line: str, region: str) -> str:
     # on every refresh-button click. Keyed on (game_name, tag_line, region),
     # so this naturally caches per-player correctly once search can pass in
     # someone other than the default account.
-    return get_puuid(game_name, tag_line, region)
+    # Also kept on disk, so already-saved matches still load when Riot's API
+    # is unavailable (dev keys expire every 24h).
+    cache_key = f"{game_name}#{tag_line}".lower()
+    try:
+        puuid = get_puuid(game_name, tag_line, region)
+    except Exception:
+        saved = _load_puuid_cache().get(cache_key)
+        if saved is None:
+            raise
+        return saved
+    saved_puuids = _load_puuid_cache()
+    if saved_puuids.get(cache_key) != puuid:
+        saved_puuids[cache_key] = puuid
+        with open(PUUID_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(saved_puuids, f)
+    return puuid
 
 
 # The account this app defaults to on load and falls back to via "Back to
@@ -983,7 +1019,7 @@ RANK_EMBLEM_CROP = {
 }
 
 def _rank_emblem_html(rank_tier: str, height: int) -> str:
-    url = "https://raw.communitydragon.org/latest/plugins/rcp-fe-lol-static-assets/global/default/images/ranked-emblem/emblem-" + rank_tier.lower() + ".png"
+    url = mirrored_url("https://raw.communitydragon.org/latest/plugins/rcp-fe-lol-static-assets/global/default/images/ranked-emblem/emblem-" + rank_tier.lower() + ".png")
     crop = RANK_EMBLEM_CROP.get(rank_tier.upper())
     if not crop:
         return "<img src='" + url + "' style='width:" + str(height) + "px;height:" + str(height) + "px;vertical-align:-" + str(round(height * 0.27)) + "px;margin-right:6px;' />"

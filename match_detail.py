@@ -457,6 +457,10 @@ def resolve_metatft_markup(
     text = re.sub(r'<TFTCurveTable([^>]*)/>', replace_curve, text)
     text = re.sub(r'<TFTCurveTable([^>]*)></>', replace_curve, text)
 
+    # Standalone inline icons; ones we have no asset for are dropped rather
+    # than left as broken images.
+    text = re.sub(r'<img id="([^"]*)"\s*/?>', lambda m: _metatft_icon_html(m.group(1)), text, flags=re.IGNORECASE)
+
     # Normalize the game's own paragraph breaks before adding our own tags.
     text = text.replace('\r', '')
     text = re.sub(r'\n{2,}', '<br><br>', text)

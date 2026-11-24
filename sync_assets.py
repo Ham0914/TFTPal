@@ -15,16 +15,17 @@ import time
 
 import requests
 
-from game_data import tex_path_to_url
+from game_data import CDRAGON_BASE
 
 CACHE_FILES = [
     "cdragon_data_cache.json",
     "companions_data_cache.json",
     "trait_static_cache.json",
 ]
-CDRAGON_BASE = "https://raw.communitydragon.org/latest/"
 PLUGIN_BASE = CDRAGON_BASE + "plugins/rcp-be-lol-game-data/global/default/"
 LOCAL_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "cdragon")
+RANK_EMBLEM_BASE = CDRAGON_BASE + "plugins/rcp-fe-lol-static-assets/global/default/images/ranked-emblem/emblem-"
+RANK_TIERS = ["iron", "bronze", "silver", "gold", "platinum", "emerald", "diamond", "master", "grandmaster", "challenger"]
 REQUEST_PAUSE = 0.05
 MAX_RETRIES = 3
 
@@ -44,12 +45,12 @@ def _asset_urls_from_value(value, out):
         if value.startswith("/lol-game-data/assets/"):
             # Companion and trait icons live under the plugin path, same as companion_icon_url()
             out.add(PLUGIN_BASE + value[len("/lol-game-data/assets/"):].lower())
-        elif value.startswith("assets/"):
-            out.add(tex_path_to_url(value))
+        elif lower.startswith("assets/"):
+            out.add(CDRAGON_BASE + "game/" + lower.replace(".tex", ".png"))
 
 
 def collect_urls() -> set:
-    urls = set()
+    urls = {f"{RANK_EMBLEM_BASE}{tier}.png" for tier in RANK_TIERS}
     for name in CACHE_FILES:
         if not os.path.exists(name):
             print(f"  skipping {name} (not found; run refresh_data.py)")

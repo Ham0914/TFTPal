@@ -42,12 +42,17 @@ def build_team_builder_payload(set_number: int = 18) -> dict:
         entry = {"id": api_name, "name": it["name"], "icon": tex_path_to_url(it["icon"])}
         if api_name.startswith("DA_Component_"):
             components.append(entry)
-        elif (api_name.startswith("DA_") and "Upgrade" not in api_name and "Emblem" not in api_name
+        elif (api_name.startswith("DA_") and "Upgrade" not in api_name
               and not it.get("isAugment")
               and len(it.get("composition") or []) == 2
               and all(p.startswith("DA_Component_") for p in it["composition"])):
-            # composition is the recipe: the two components that combine into this item
-            completed.append({**entry, "composition": list(it["composition"])})
+            # composition is the recipe: the two components that combine into this item.
+            # Emblems are included here too — Spatula/Frying Pan + a component is a real
+            # Set 18 recipe, same shape as any other completed item's composition.
+            # Emblems are matched to traits by display name; the API ids aren't consistent
+            # (DA_18_EmblemSlayer -> DA_18_Slayer, but DA_18_EmblemPrimal -> DA_Primal18).
+            granted_trait = name_to_trait_id.get(it["name"].removesuffix(" Emblem")) if "Emblem" in api_name else None
+            completed.append({**entry, "composition": list(it["composition"]), "grantedTrait": granted_trait})
 
     return {
         "champions": sorted(champions, key=lambda c: (c["cost"], c["name"])),
@@ -85,17 +90,34 @@ TEMPLATE = r"""<!DOCTYPE html>
 
   /* Board */
   .board { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; position: relative; }
-  .hex-row { display: flex; gap: 5px; }
-  .hex-row + .hex-row { margin-top: -21px; }
-  .hex-row.offset { margin-left: 42px; }
-  .hex-wrap { position: relative; width: 76px; height: 86px; }
-  .hex { position: absolute; inset: 0; clip-path: polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%); background: #2e323d; transition: background 0.15s; }
+  .hex-row { display: flex; gap: 12px; }
+  /* 76px hexes + 12px gap = 88px column pitch. A 76px row pitch makes the
+     diagonal gap between rows match that 12px. */
+  .hex-row + .hex-row { margin-top: -12px; }
+  .hex-row.offset { margin-left: 44px; }
+  .hex-wrap { position: relative; width: 76px; height: 88px; }
+  .hex { position: absolute; inset: 0; z-index: 1; clip-path: polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%); background: #2e323d; transition: background 0.15s; }
   .hex.over { background: #d4af37; }
-  .hex-inner { position: absolute; inset: 3px; clip-path: polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%); background: #14171f; overflow: hidden; display: flex; align-items: center; justify-content: center; }
+  .hex-inner { position: absolute; inset: 3px; z-index: 2; clip-path: polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%); background: #14171f; overflow: hidden; display: flex; align-items: center; justify-content: center; }
+  /* The glow sits on the unclipped wrapper: clip-path applies after filter, so a
+     drop-shadow on .hex / .hex-inner gets clipped away. :hover doesn't update
+     during a native drag, hence the JS-set .glow class as well. */
+  .hex-wrap { transition: filter 0.12s, transform 0.12s; }
+  .hex-wrap:has(img.unit):hover, .hex-wrap.glow {
+    filter: drop-shadow(0 0 5px #ffd95e) drop-shadow(0 0 12px #d4af37);
+    transform: scale(1.06);
+    z-index: 6;
+  }
+  .champ { transition: box-shadow 0.12s; }
+  .champ:hover { box-shadow: 0 0 4px #ffd95e, 0 0 10px #d4af37; z-index: 1; }
   .hex-inner img.unit { width: 100%; height: 100%; object-fit: cover; display: block; }
-  .hex-items { position: absolute; left: 0; right: 0; bottom: -18px; display: flex; justify-content: center; gap: 3px; }
-  .hex-items img { width: 18px; height: 18px; border-radius: 4px; border: 1px solid #555; background: #14171f; cursor: pointer; }
-  .hex-items img:hover { border-color: #e05a5a; }
+  /* Sits over the lower half of the unit's own portrait rather than hanging
+     below the hex — with rows overlapping (see margin-top above), anything
+     below the hex boundary would sit on top of the unit in the row beneath it. */
+  .hex-items { position: absolute; left: 0; right: 0; bottom: 10px; z-index: 3; display: flex; justify-content: center; gap: 3px; }
+  .hex-item-wrap { width: 18px; height: 18px; border-radius: 4px; border: 1px solid #555; background: #14171f; cursor: pointer; overflow: hidden; }
+  .hex-item-wrap:hover { border-color: #e05a5a; }
+  .hex-item-wrap img { width: 100%; height: 100%; object-fit: cover; display: block; pointer-events: none; }
   .board-title { position: absolute; top: 2px; left: 0; color: #666; font-size: 11px; letter-spacing: 1px; }
   .toast { position: absolute; top: 4px; left: 50%; transform: translateX(-50%); background: rgba(192,57,43,0.9); color: #fff; padding: 6px 14px; border-radius: 8px; font-weight: 600; opacity: 0; transition: opacity 0.2s; pointer-events: none; z-index: 5; }
   .toast.show { opacity: 1; }
@@ -117,11 +139,12 @@ TEMPLATE = r"""<!DOCTYPE html>
   .champ .cname { position: absolute; bottom: 0; left: 0; right: 0; background: rgba(0,0,0,0.7); color: #fff; font-size: 10px; font-weight: 600; text-align: center; padding: 1px 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .items-scroll { display: flex; flex-direction: column; gap: 10px; }
   .comp-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(44px, 1fr)); grid-auto-rows: 44px; gap: 6px; }
-  .comp-item { width: 100%; height: 100%; border-radius: 7px; border: 1px solid #555; background: #14171f; cursor: grab; object-fit: cover; }
+  .comp-item { width: 100%; height: 100%; border-radius: 7px; border: 1px solid #555; background: #14171f; cursor: grab; overflow: hidden; }
+  .comp-item img { width: 100%; height: 100%; object-fit: cover; display: block; pointer-events: none; }
   .craft-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(84px, 1fr)); grid-auto-rows: 80px; gap: 7px; }
   .item-card { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; cursor: grab; border-radius: 7px; padding: 3px; background: rgba(255,255,255,0.02); }
-  .item-card img { width: 40px; height: 40px; border-radius: 6px; border: 1px solid #555; background: #14171f; }
-  .item-card span { font-size: 9px; color: #bbb; text-align: center; line-height: 1.15; }
+  .item-card img { width: 40px; height: 40px; border-radius: 6px; border: 1px solid #555; background: #14171f; pointer-events: none; }
+  .item-card span { font-size: 9px; color: #bbb; text-align: center; line-height: 1.15; pointer-events: none; }
 </style></head>
 <body>
 <div class="frame">
@@ -193,6 +216,31 @@ const SLOT_COUNT = ROWS.reduce((a,b)=>a+b,0);
 let board = Array.from({length: SLOT_COUNT}, () => null); // {id, items:[]} or null
 let undoStack = [], redoStack = [];
 let champSort = "cost";
+document.addEventListener("dragend", () => {
+  if (hoveredSlot !== null) { clearCellHighlight(hoveredSlot); hoveredSlot = null; }
+});
+
+// Bordered drag preview. Drawn from the already-loaded on-screen <img>, because
+// setDragImage snapshots synchronously and a new <img> wouldn't have loaded yet.
+function dragGhost(e, imgEl, size = 44) {
+  const canvas = document.createElement("canvas");
+  canvas.width = size; canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#14171f";
+  ctx.beginPath(); ctx.roundRect(0, 0, size, size, 8); ctx.fill();
+  try {
+    ctx.save();
+    ctx.beginPath(); ctx.roundRect(2, 2, size - 4, size - 4, 6); ctx.clip();
+    ctx.drawImage(imgEl, 2, 2, size - 4, size - 4);
+    ctx.restore();
+  } catch (err) { /* source not decoded yet — falls back to the plain bordered box */ }
+  ctx.strokeStyle = "#d4af37"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.roundRect(1, 1, size - 2, size - 2, 8); ctx.stroke();
+  canvas.style.cssText = "position:fixed;top:-1000px;left:-1000px;";
+  document.body.appendChild(canvas);
+  e.dataTransfer.setDragImage(canvas, size / 2, size / 2);
+  setTimeout(() => canvas.remove(), 0);
+}
 
 // ---- history ----
 function snapshot() { undoStack.push(JSON.stringify(board)); if (undoStack.length > 100) undoStack.shift(); redoStack = []; }
@@ -210,6 +258,21 @@ function flash(msg) {
 }
 
 // ---- board layout ----
+// One delegated dragover listener tracks the hovered cell, so crossing between a
+// cell's stacked children doesn't toggle the highlight.
+let hoveredSlot = null;
+function cellAt(slot) { return document.querySelectorAll(".hex-wrap")[slot]; }
+function setCellHighlight(slot) {
+  const cell = cellAt(slot);
+  if (board[slot]) cell.classList.add("glow");
+  else cell.querySelector(".hex").classList.add("over");
+}
+function clearCellHighlight(slot) {
+  const cell = cellAt(slot);
+  cell.querySelector(".hex").classList.remove("over");
+  cell.classList.remove("glow");
+}
+
 function buildBoard() {
   const wrap = document.getElementById("boardRows");
   wrap.innerHTML = "";
@@ -223,12 +286,38 @@ function buildBoard() {
       cell.className = "hex-wrap";
       cell.innerHTML = '<div class="hex"></div><div class="hex-inner"></div><div class="hex-items"></div>';
       cell.dataset.slot = slot;
-      cell.addEventListener("dragover", e => { e.preventDefault(); cell.querySelector(".hex").classList.add("over"); });
-      cell.addEventListener("dragleave", () => cell.querySelector(".hex").classList.remove("over"));
-      cell.addEventListener("drop", e => { e.preventDefault(); cell.querySelector(".hex").classList.remove("over"); onBoardDrop(slot, e); });
+      cell.addEventListener("drop", e => {
+        e.preventDefault();
+        if (hoveredSlot !== null) { clearCellHighlight(hoveredSlot); hoveredSlot = null; }
+        onBoardDrop(slot, e);
+      });
+      // Right-click a unit to remove it in one motion, no drag required.
+      cell.addEventListener("contextmenu", e => {
+        e.preventDefault();
+        if (!board[slot]) return;
+        snapshot(); board[slot] = null; render();
+      });
       row.appendChild(cell);
     }
     wrap.appendChild(row);
+  });
+
+  wrap.addEventListener("dragover", e => {
+    e.preventDefault(); // required on every dragover, or drop never fires
+    const cell = e.target.closest(".hex-wrap");
+    if (!cell) return;
+    const slot = +cell.dataset.slot;
+    if (hoveredSlot === slot) return;
+    if (hoveredSlot !== null) clearCellHighlight(hoveredSlot);
+    hoveredSlot = slot;
+    setCellHighlight(slot);
+  });
+  wrap.addEventListener("dragleave", e => {
+    // Only clear when the cursor has actually left the whole board, not just
+    // moved to a different element still inside it (relatedTarget is where
+    // the cursor is going; null or outside wrap means a genuine exit).
+    if (e.relatedTarget && wrap.contains(e.relatedTarget)) return;
+    if (hoveredSlot !== null) { clearCellHighlight(hoveredSlot); hoveredSlot = null; }
   });
 }
 
@@ -243,20 +332,24 @@ function renderBoard() {
       const c = CHAMP[s.id];
       hex.style.background = COST_COLORS[c.cost];
       inner.innerHTML = `<img class="unit" src="${c.icon}" draggable="true" title="${c.name}">`;
-      inner.querySelector("img").addEventListener("dragstart", e =>
-        e.dataTransfer.setData("text/plain", JSON.stringify({kind:"move", from: slot})));
+      const unitImg = inner.querySelector("img");
+      unitImg.addEventListener("dragstart", e => {
+        e.dataTransfer.setData("text/plain", JSON.stringify({kind:"move", from: slot}));
+        dragGhost(e, unitImg, 60);
+      });
       items.innerHTML = s.items.map((id, i) =>
-        `<img src="${ITEM[id].icon}" title="${ITEM[id].name} (click to remove)" draggable="true" data-i="${i}">`).join("");
-      items.querySelectorAll("img").forEach(im => {
-        const i = +im.dataset.i;
-        im.addEventListener("dragstart", e => {
+        `<div class="hex-item-wrap" draggable="true" title="${ITEM[id].name} (click to remove)" data-i="${i}"><img src="${ITEM[id].icon}"></div>`).join("");
+      items.querySelectorAll(".hex-item-wrap").forEach(wrap => {
+        const i = +wrap.dataset.i;
+        wrap.addEventListener("dragstart", e => {
           e.stopPropagation();
           e.dataTransfer.setData("text/plain", JSON.stringify({kind:"unitItem", from: slot, idx: i, id: s.items[i]}));
+          dragGhost(e, wrap.querySelector("img"));
         });
-        im.addEventListener("click", e => { e.stopPropagation(); removeItem(slot, i); });
+        wrap.addEventListener("click", e => { e.stopPropagation(); removeItem(slot, i); });
       });
     } else {
-      hex.style.background = "#2e323d";
+      hex.style.background = "";
       inner.innerHTML = "";
       items.innerHTML = "";
     }
@@ -265,8 +358,21 @@ function renderBoard() {
 
 // ---- traits panel ----
 function renderTraits() {
+  // Same champion placed on more than one hex counts once, not once per hex —
+  // matches how trait activation actually works (it's about which distinct
+  // champions you have, not how many tiles they occupy).
+  // Equipped emblems add their trait to that champion.
+  const seen = new Set();
   const counts = {};
-  board.forEach(s => { if (!s) return; CHAMP[s.id].traits.forEach(t => counts[t] = (counts[t]||0) + 1); });
+  board.filter(Boolean).forEach(s => {
+    const emblems = s.items.map(id => ITEM[id].grantedTrait).filter(Boolean);
+    [...CHAMP[s.id].traits, ...emblems].forEach(t => {
+      const key = s.id + "|" + t;
+      if (seen.has(key)) return;
+      seen.add(key);
+      counts[t] = (counts[t]||0) + 1;
+    });
+  });
   const rows = Object.entries(counts).map(([id, n]) => {
     const t = TRAIT[id]; if (!t) return null;
     let tier = -1; t.breakpoints.forEach((b, i) => { if (n >= b) tier = i; });
@@ -297,14 +403,29 @@ function applyItemDrop(targetSlot, itemId, src) {
   if (COMPONENT_IDS.has(itemId)) {
     combineAt = items.findIndex(x => COMPONENT_IDS.has(x) && COMBO[pairKey(x, itemId)]);
   }
+  // What will actually end up on the unit: either the dropped item itself, or —
+  // if this drop completes a Spatula/Frying Pan recipe — the resulting emblem.
+  const resultId = combineAt >= 0 ? COMBO[pairKey(items[combineAt], itemId)] : itemId;
+  const resultItem = ITEM[resultId];
+
+  if (resultItem.grantedTrait) {
+    const traitName = TRAIT[resultItem.grantedTrait]?.name || "this trait";
+    if (CHAMP[target.id].traits.includes(resultItem.grantedTrait)) {
+      flash(`${CHAMP[target.id].name} already has ${traitName}`);
+      return;
+    }
+    if (items.some(id => ITEM[id].grantedTrait === resultItem.grantedTrait)) {
+      flash(`Already has an emblem for ${traitName}`);
+      return;
+    }
+  }
   if (combineAt < 0 && items.length >= MAX_ITEMS) { flash(`Max ${MAX_ITEMS} items per champion`); return; }
 
   snapshot();
   if (src) board[src.slot].items.splice(src.idx, 1);
   if (combineAt >= 0) {
-    const result = COMBO[pairKey(items[combineAt], itemId)];
     items.splice(combineAt, 1);
-    items.push(result);
+    items.push(resultId);
   } else {
     items.push(itemId);
   }
@@ -322,11 +443,14 @@ function removeItem(slot, idx) {
 // ---- items panel ----
 function renderItemPanels() {
   document.getElementById("components").innerHTML = DATA.components.map(i =>
-    `<img class="comp-item" src="${i.icon}" title="${i.name}" draggable="true" data-id="${i.id}">`).join("");
+    `<div class="comp-item" draggable="true" title="${i.name}" data-id="${i.id}"><img src="${i.icon}"></div>`).join("");
   document.getElementById("craftables").innerHTML = DATA.completed.map(i =>
     `<div class="item-card" draggable="true" data-id="${i.id}" title="${i.name}"><img src="${i.icon}"><span>${i.name}</span></div>`).join("");
   document.querySelectorAll("#components .comp-item, #craftables .item-card").forEach(el =>
-    el.addEventListener("dragstart", e => e.dataTransfer.setData("text/plain", JSON.stringify({kind:"item", id: el.dataset.id}))));
+    el.addEventListener("dragstart", e => {
+      e.dataTransfer.setData("text/plain", JSON.stringify({kind:"item", id: el.dataset.id}));
+      dragGhost(e, el.querySelector("img"));
+    }));
 }
 
 // ---- champion bench ----
@@ -340,8 +464,21 @@ function renderChampions() {
   const grid = document.getElementById("champGrid");
   grid.innerHTML = list.map(c => `<div class="champ" draggable="true" data-id="${c.id}" style="border-color:${COST_COLORS[c.cost]}">
     <img src="${c.icon}"><div class="cname">${c.name}</div></div>`).join("");
-  grid.querySelectorAll(".champ").forEach(el => el.addEventListener("dragstart", e =>
-    e.dataTransfer.setData("text/plain", JSON.stringify({kind:"champ", id: el.dataset.id}))));
+  grid.querySelectorAll(".champ").forEach(el => {
+    el.addEventListener("dragstart", e => {
+      e.dataTransfer.setData("text/plain", JSON.stringify({kind:"champ", id: el.dataset.id}));
+      dragGhost(e, el.querySelector("img"), 60);
+    });
+    // Right-click a bench champion to place them without dragging — fills the
+    // first empty slot searching from the bottom-right corner of the board.
+    el.addEventListener("contextmenu", e => {
+      e.preventDefault();
+      for (let i = SLOT_COUNT - 1; i >= 0; i--) {
+        if (!board[i]) { snapshot(); board[i] = {id: el.dataset.id, items: []}; render(); return; }
+      }
+      flash("Board is full");
+    });
+  });
 }
 
 document.querySelectorAll(".tab[data-sub]").forEach(b => b.onclick = () => { champSort = b.dataset.sub; renderChampions(); });

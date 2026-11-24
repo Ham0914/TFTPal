@@ -78,13 +78,28 @@ def translate_items(items_string: str, item_lookup: dict) -> str:
     readable_names = [item_lookup.get(raw_id, raw_id) for raw_id in raw_ids]
     return ", ".join(readable_names)
 
+CDRAGON_BASE = "https://raw.communitydragon.org/latest/"
+MIRROR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "cdragon")
+
+
+def mirrored_url(url: str) -> str:
+    """
+    Returns the locally served copy of a CommunityDragon image (see
+    sync_assets.py) if it has been downloaded, otherwise the original URL.
+    """
+    rel = url.removeprefix(CDRAGON_BASE)
+    if rel != url and os.path.exists(os.path.join(MIRROR_DIR, *rel.split("/"))):
+        return "/app/static/cdragon/" + rel
+    return url
+
+
 def tex_path_to_url(path: str) -> str:
     """
     Converts a raw game asset path (e.g. 'assets/characters/.../icon.tex')
     into an actual loadable image URL from CommunityDragon.
     """
     converted = path.lower().replace(".tex", ".png")
-    return f"https://raw.communitydragon.org/latest/game/{converted}"
+    return mirrored_url(f"{CDRAGON_BASE}game/{converted}")
 
 
 def build_champion_data(set_number: int = 18) -> dict:
@@ -134,7 +149,7 @@ def companion_icon_url(loadouts_icon_path: str) -> str:
     tex_path_to_url, since this comes from a different data source.
     """
     stripped = loadouts_icon_path.replace("/lol-game-data/assets/", "", 1)
-    return f"https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/global/default/{stripped.lower()}"
+    return mirrored_url(f"{CDRAGON_BASE}plugins/rcp-be-lol-game-data/global/default/{stripped.lower()}")
 
 TRAIT_STATIC_CACHE_FILE = "trait_static_cache.json"
 _trait_static_in_memory_cache = None

@@ -5,3 +5,5 @@ __pycache__/
 # Mirrored CommunityDragon images (large; regenerate with sync_assets.py)
 static/cdragon/
 static/cdragon_failed.txt
+
+.streamlit/secrets.toml
